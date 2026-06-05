@@ -19,7 +19,7 @@ pub struct EntityNode {
     pub created_at: DateTime<Utc>,
     pub summary: String,
     pub attributes: Map<String, Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name_embedding: Option<Vec<f32>>,
 }
 

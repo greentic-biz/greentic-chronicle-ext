@@ -34,7 +34,7 @@ pub struct EpisodicNode {
     /// UUIDs of EntityEdges derived from this episode.
     pub entity_edges: Vec<String>,
     pub created_at: DateTime<Utc>,
-    /// When the episode's content was true/occurred (reference_time).
+    /// When the original episode document was created/occurred (upstream: "datetime of when the original document was created").
     pub valid_at: DateTime<Utc>,
 }
 

@@ -27,15 +27,19 @@ pub struct EntityEdge {
     /// Episode UUIDs in which this fact was mentioned.
     pub episodes: Vec<String>,
     pub created_at: DateTime<Utc>,
+    #[serde(default)]
     pub expired_at: Option<DateTime<Utc>>,
+    #[serde(default)]
     pub valid_at: Option<DateTime<Utc>>,
+    #[serde(default)]
     pub invalid_at: Option<DateTime<Utc>>,
     pub attributes: Map<String, Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fact_embedding: Option<Vec<f32>>,
 }
 
 impl EntityEdge {
+    // NOTE: positional String params mirror upstream ctor order; consider a builder if call sites multiply.
     pub fn new(
         source_node_uuid: String,
         target_node_uuid: String,
@@ -95,7 +99,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn entity_edge_roundtrips_with_bitemporal_fields() {
+    fn entity_edge_roundtrips_none_bitemporal() {
         let edge = EntityEdge::new(
             "u1".into(),
             "u2".into(),
@@ -107,5 +111,39 @@ mod tests {
         let json = serde_json::to_string(&edge).unwrap();
         let back: EntityEdge = serde_json::from_str(&json).unwrap();
         assert_eq!(back.fact, "Alice works at Acme");
+    }
+
+    #[test]
+    fn entity_edge_roundtrips_with_bitemporal_fields_set() {
+        let mut edge = EntityEdge::new(
+            "u1".into(),
+            "u2".into(),
+            "WORKS_AT".into(),
+            "f".into(),
+            "g1".into(),
+        );
+        edge.valid_at = Some(chrono::Utc::now());
+        edge.expired_at = Some(chrono::Utc::now());
+        let json = serde_json::to_string(&edge).unwrap();
+        let back: EntityEdge = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.valid_at, edge.valid_at);
+        assert_eq!(back.expired_at, edge.expired_at);
+    }
+
+    #[test]
+    fn entity_edge_deserializes_when_optional_fields_absent() {
+        // Driver-boundary contract: absent Option fields must parse as None.
+        let json = r#"{
+            "uuid":"e1","source_node_uuid":"u1","target_node_uuid":"u2",
+            "name":"WORKS_AT","fact":"f","group_id":"g1","episodes":[],
+            "created_at":"2026-01-01T00:00:00Z","attributes":{}
+        }"#;
+        let edge: EntityEdge = serde_json::from_str(json).unwrap();
+        assert!(
+            edge.valid_at.is_none()
+                && edge.invalid_at.is_none()
+                && edge.expired_at.is_none()
+                && edge.fact_embedding.is_none()
+        );
     }
 }

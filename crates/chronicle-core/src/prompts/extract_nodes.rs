@@ -479,8 +479,6 @@ mod tests {
 
     #[test]
     fn extract_text_renders_verbatim() {
-        let prev: Vec<String> = vec![];
-        let _ = &prev;
         let ctx = ExtractTextContext {
             entity_types: &entity_types(),
             episode_content: "Dr. Amara Osei presented at AAN.",

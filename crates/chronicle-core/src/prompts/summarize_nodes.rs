@@ -17,7 +17,7 @@ use crate::prompts::helpers::{DO_NOT_ESCAPE_UNICODE, to_prompt_json};
 use crate::prompts::snippets::SUMMARY_INSTRUCTIONS;
 
 /// Context for [`summarize_context`].
-pub struct SummarizeContextContext<'a> {
+pub struct SummarizeContext<'a> {
     /// Upstream `context['previous_episodes']`, rendered via to_prompt_json.
     pub previous_episodes: &'a [String],
     /// Upstream `context['episode_content']`, rendered via to_prompt_json.
@@ -31,7 +31,7 @@ pub struct SummarizeContextContext<'a> {
 }
 
 /// Verbatim port of upstream `summarize_context`.
-pub fn summarize_context(ctx: &SummarizeContextContext<'_>) -> Vec<Message> {
+pub fn summarize_context(ctx: &SummarizeContext<'_>) -> Vec<Message> {
     let sys_prompt = format!(
         "You are a helpful assistant that generates detailed, information-dense summaries and attributes from provided text.{DO_NOT_ESCAPE_UNICODE}"
     );
@@ -87,7 +87,7 @@ mod tests {
         let prev = vec!["Mina: hi".to_string()];
         let episode = serde_json::json!("Jordan presented a ceramics workshop.");
         let attributes = serde_json::json!({"role": "instructor"});
-        let ctx = SummarizeContextContext {
+        let ctx = SummarizeContext {
             previous_episodes: &prev,
             episode_content: &episode,
             node_name: "Jordan Lee",

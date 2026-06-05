@@ -189,7 +189,8 @@ fn is_falsy(value: &serde_json::Value) -> bool {
         serde_json::Value::String(s) => s.is_empty(),
         serde_json::Value::Array(a) => a.is_empty(),
         serde_json::Value::Object(o) => o.is_empty(),
-        serde_json::Value::Number(_) => false,
+        // Python: bool(0) == False, bool(non-zero) == True.
+        serde_json::Value::Number(n) => n.as_f64().is_some_and(|v| v == 0.0),
     }
 }
 
@@ -270,6 +271,42 @@ mod tests {
         };
         let msgs = edge(&ctx);
         assert!(!msgs[1].content.contains("<FACT_TYPES>"));
+    }
+
+    #[test]
+    fn zero_number_suppresses_fact_types_block() {
+        // Python truthiness: bool(0) == False → FACT_TYPES should be omitted.
+        let prev: Vec<String> = vec![];
+        let nodes = serde_json::json!([{"name": "Alice"}]);
+        let zero = serde_json::json!(0);
+        let ctx = EdgeContext {
+            previous_episodes: &prev,
+            episode_content: "Alice exists.",
+            nodes: &nodes,
+            reference_time: "2025-04-30T00:00:00Z",
+            edge_types: Some(&zero),
+            custom_extraction_instructions: "",
+        };
+        let msgs = edge(&ctx);
+        assert!(!msgs[1].content.contains("<FACT_TYPES>"));
+    }
+
+    #[test]
+    fn nonzero_number_keeps_fact_types_block() {
+        // Python truthiness: bool(1) == True → FACT_TYPES should be present.
+        let prev: Vec<String> = vec![];
+        let nodes = serde_json::json!([{"name": "Alice"}]);
+        let one = serde_json::json!(1);
+        let ctx = EdgeContext {
+            previous_episodes: &prev,
+            episode_content: "Alice exists.",
+            nodes: &nodes,
+            reference_time: "2025-04-30T00:00:00Z",
+            edge_types: Some(&one),
+            custom_extraction_instructions: "",
+        };
+        let msgs = edge(&ctx);
+        assert!(msgs[1].content.contains("<FACT_TYPES>"));
     }
 
     #[test]

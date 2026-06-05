@@ -41,12 +41,18 @@ NEVER fabricate entity names or mark distinct entities as duplicates.{DO_NOT_ESC
     let existing_nodes = to_prompt_json(ctx.existing_nodes);
 
     // len(context['extracted_nodes']) — only arrays carry a length upstream.
+    // Upstream never calls this with an empty list; the debug_assert documents that
+    // invariant and guards against count underflow in the subtraction below.
     let count = ctx
         .extracted_nodes
         .as_array()
         .map(|a| a.len() as i64)
         .unwrap_or(0);
-    let count_minus_one = count - 1;
+    debug_assert!(
+        count > 0,
+        "nodes() called with empty extracted_nodes - prompt will be malformed"
+    );
+    let count_minus_one = count.saturating_sub(1);
 
     let user_prompt = format!(
         r#"

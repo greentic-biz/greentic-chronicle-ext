@@ -5,7 +5,7 @@ members = [
     "crates/chronicle-core",
     "crates/chronicle-testkit",
     "crates/chronicle-driver-neo4j",
-    # "crates/chronicle-llm-openai",
+    "crates/chronicle-llm-openai",
 ]
 
 [workspace.package]
@@ -30,5 +30,9 @@ blake2 = "0.10"
 tracing = "0.1"
 rand = "0.9"
 neo4rs = "0.8"
-async-openai = "0.40"
+async-openai = { version = "0.40", default-features = false, features = [
+    "rustls",
+    "chat-completion",
+    "embedding",
+] }
 anyhow = "1"

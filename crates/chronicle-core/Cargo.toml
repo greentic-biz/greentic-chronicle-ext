@@ -19,3 +19,6 @@ chrono.workspace = true
 blake2.workspace = true
 tracing.workspace = true
 rand.workspace = true
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "test-util"] }

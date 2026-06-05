@@ -5,6 +5,7 @@ pub mod embedder;
 pub mod errors;
 pub mod helpers;
 pub mod llm;
+pub mod pipeline;
 pub mod prompts;
 pub mod types;
 

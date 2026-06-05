@@ -4,7 +4,7 @@ members = [
     # restored as crates land (tasks 2, 9, 15, 16)
     "crates/chronicle-core",
     "crates/chronicle-testkit",
-    # "crates/chronicle-driver-neo4j",
+    "crates/chronicle-driver-neo4j",
     # "crates/chronicle-llm-openai",
 ]
 

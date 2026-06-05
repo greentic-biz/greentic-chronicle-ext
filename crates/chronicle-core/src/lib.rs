@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod driver;
 pub mod embedder;
 pub mod errors;
 pub mod helpers;

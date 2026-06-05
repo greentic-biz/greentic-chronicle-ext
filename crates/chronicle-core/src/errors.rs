@@ -2,8 +2,10 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum ChronicleError {
-    // #[error("driver error: {0}")]
-    // Driver(#[from] crate::driver::DriverError),      // enabled in task 8
+    #[error("driver error: {0}")]
+    Driver(#[from] crate::driver::DriverError),
+    #[error("edge not found: {uuid}")]
+    EdgeNotFound { uuid: String },
     #[error("llm error: {0}")]
     Llm(#[from] crate::llm::LlmError),
     #[error("embedder error: {0}")]

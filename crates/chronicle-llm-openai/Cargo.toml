@@ -16,5 +16,9 @@ serde_json.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+chronicle-driver-neo4j.workspace = true
 serde.workspace = true
 schemars.workspace = true
+chrono.workspace = true
+anyhow.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

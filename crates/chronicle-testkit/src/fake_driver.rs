@@ -39,6 +39,15 @@ impl FakeDriver {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Returns the number of stored [`EpisodicEdge`] entries.
+    /// If the lock is poisoned, returns `0`.
+    pub fn episodic_edge_count(&self) -> usize {
+        self.inner
+            .lock()
+            .map(|g| g.episodic_edges.len())
+            .unwrap_or(0)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -225,6 +234,7 @@ impl SearchOps for FakeDriver {
     /// `group_ids` is non-empty. Results truncated to `limit`.
     /// NOTE: Not a real BM25 ranking — only tests that need deterministic
     /// recall (not ranking precision) should use this.
+    /// Result order within the limit is undefined (HashMap iteration); only assert recall, not ranking.
     async fn edge_fulltext_search(
         &self,
         query: &str,
@@ -270,13 +280,18 @@ impl SearchOps for FakeDriver {
                 }
             })
             .collect();
-        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        scored.sort_by(|a, b| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.1.uuid.cmp(&b.1.uuid))
+        });
         Ok(scored.into_iter().take(limit).map(|(_, e)| e).collect())
     }
 
     /// Approximation of BM25 fulltext: case-insensitive substring match of
     /// `query` against `name` + `summary` fields. Group-filtered when
     /// `group_ids` is non-empty. Results truncated to `limit`.
+    /// Result order within the limit is undefined (HashMap iteration); only assert recall, not ranking.
     async fn node_fulltext_search(
         &self,
         query: &str,
@@ -322,7 +337,11 @@ impl SearchOps for FakeDriver {
                 }
             })
             .collect();
-        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        scored.sort_by(|a, b| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.1.uuid.cmp(&b.1.uuid))
+        });
         Ok(scored.into_iter().take(limit).map(|(_, n)| n).collect())
     }
 }
@@ -607,8 +626,74 @@ mod tests {
         let e2 = EpisodicEdge::new("ep2".into(), "n2".into(), "g1".into(), Utc::now());
         driver.save_episodic_edges(&[e1]).await.unwrap();
         driver.save_episodic_edges(&[e2]).await.unwrap();
-        let g = driver.inner.lock().unwrap();
-        assert_eq!(g.episodic_edges.len(), 2);
+        assert_eq!(driver.episodic_edge_count(), 2);
+    }
+
+    // ------------------------------------------------------------------
+    // Node similarity search: ranking + skip-no-embedding
+    // ------------------------------------------------------------------
+    #[tokio::test]
+    async fn node_similarity_search_ranks_matching_string_first() {
+        let driver = FakeDriver::new();
+        let emb = MockEmbedder::new(8);
+
+        let mut node_alpha = make_node("n-alpha", "alpha", "g1");
+        node_alpha.name_embedding = Some(emb.create("alpha").await.unwrap());
+
+        let mut node_beta = make_node("n-beta", "beta", "g1");
+        node_beta.name_embedding = Some(emb.create("beta").await.unwrap());
+
+        // node without embedding — must be skipped, not panic
+        let node_no_emb = make_node("n-no-emb", "gamma", "g1");
+
+        driver
+            .save_entity_nodes(&[node_alpha, node_beta, node_no_emb])
+            .await
+            .unwrap();
+
+        let query_vec = emb.create("alpha").await.unwrap();
+        let results = driver
+            .node_similarity_search(&query_vec, &[], 10, 0.0)
+            .await
+            .unwrap();
+
+        // node without embedding must not appear in results
+        assert!(
+            results.iter().all(|n| n.uuid != "n-no-emb"),
+            "node without embedding must be skipped"
+        );
+        assert!(!results.is_empty(), "should return at least one result");
+        assert_eq!(results[0].name, "alpha", "alpha node should rank first");
+
+        // Verify score ~ 1.0 for exact match
+        let score = cosine(&query_vec, &emb.create("alpha").await.unwrap());
+        assert!((score - 1.0).abs() < 1e-5, "cosine score should be ~1.0");
+    }
+
+    // ------------------------------------------------------------------
+    // retrieve_episodes: empty group_ids returns all groups
+    // ------------------------------------------------------------------
+    #[tokio::test]
+    async fn retrieve_episodes_empty_group_ids_returns_all_groups() {
+        let driver = FakeDriver::new();
+        let now = Utc::now();
+        let ep_g1 = make_episode("ep-g1", "g1", EpisodeType::Message, now);
+        let ep_g2 = make_episode("ep-g2", "g2", EpisodeType::Message, now);
+        driver.save_episode(&ep_g1).await.unwrap();
+        driver.save_episode(&ep_g2).await.unwrap();
+
+        // Empty group_ids slice — must return episodes from ALL groups
+        let results = driver.retrieve_episodes(now, 100, &[], None).await.unwrap();
+
+        let uuids: Vec<&str> = results.iter().map(|ep| ep.uuid.as_str()).collect();
+        assert!(
+            uuids.contains(&"ep-g1"),
+            "ep-g1 (group g1) should be returned"
+        );
+        assert!(
+            uuids.contains(&"ep-g2"),
+            "ep-g2 (group g2) should be returned"
+        );
     }
 
     // ------------------------------------------------------------------

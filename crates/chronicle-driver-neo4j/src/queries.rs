@@ -8,6 +8,34 @@
 //! - `graphiti_core/utils/maintenance/graph_data_operations.py` (retrieve_episodes)
 //! - `graphiti_core/edges.py` / `graphiti_core/nodes.py` (get_by_uuid / get_between_nodes)
 //! - `graphiti_core/helpers.py::lucene_sanitize` (lucene escaping)
+//! - `graphiti_core/helpers.py::validate_group_id` / `validate_group_ids` (input validation)
+//!
+//! ## Fidelity notes (Task 17 ledger)
+//!
+//! ### OR-precedence quirk in multi-group lucene scoping (bug-for-bug reproduction)
+//!
+//! `build_fulltext_query` joins group-scope clauses with bare ` OR ` and appends
+//! ` AND (terms)` at the end. For two groups this produces:
+//!
+//! ```text
+//! group_id:"g1" OR group_id:"g2" AND (terms)
+//! ```
+//!
+//! Lucene operator precedence makes `AND` bind tighter than `OR`, so the query is
+//! effectively `group_id:"g1" OR (group_id:"g2" AND (terms))`. The intent is
+//! `(group_id:"g1" OR group_id:"g2") AND (terms)`, but upstream
+//! `search_utils.py::fulltext_query` emits the same unparenthesised form
+//! (commit 34f56e65). We reproduce this verbatim for fidelity; the correct fix
+//! would parenthesise the OR group — tracked in Task 17 and left for the upstream
+//! fix cycle.
+//!
+//! ### `fact_triple` read-compat gap
+//!
+//! Upstream v0.29.1 no longer stores the `fact_triple` property on `RELATES_TO`
+//! edges, but older graphs may have it. Our RETURN clause omits `e.fact_triple`
+//! (matching current upstream schema), meaning older edges with the property will
+//! silently drop it on round-trip read. Applications that need `fact_triple`
+//! back-compat must project it explicitly or migrate the data. Tracked in Task 17.
 //!
 //! DEVIATION (props-map adaptation): upstream Neo4j save uses `SET n = $entity_data`
 //! where `$entity_data` is a flat property map (core fields + flattened attributes),
@@ -405,6 +433,53 @@ pub fn drop_index_statements() -> Vec<String> {
 // LUCENE FULLTEXT QUERY BUILDER
 // =====================================================================
 
+use chronicle_core::driver::DriverError;
+
+/// Validate a single `group_id` against the upstream-allowed character set.
+///
+/// Port of `graphiti_core/helpers.py::validate_group_id` @ 34f56e65 (v0.29.1).
+/// Upstream pattern: `^[a-zA-Z0-9_-]+$` (ASCII alphanumeric, dash, underscore).
+/// Empty / `None` (represented here as an empty string) is treated as valid by
+/// upstream (`if not group_id: return True`) — we mirror that by accepting an
+/// empty slice element, but in practice callers never produce empty `group_id`
+/// strings in normal use.
+///
+/// On invalid input, upstream raises `GroupIdValidationError` with the message:
+/// `group_id "{id}" must contain only alphanumeric characters, dashes, or underscores`.
+/// We surface the same message via `DriverError::Query`.
+fn validate_group_id(group_id: &str) -> Result<(), DriverError> {
+    // Upstream: `if not group_id: return True`
+    if group_id.is_empty() {
+        return Ok(());
+    }
+    if group_id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        Ok(())
+    } else {
+        Err(DriverError::Query(format!(
+            "group_id \"{group_id}\" must contain only alphanumeric characters, dashes, or underscores"
+        )))
+    }
+}
+
+/// Validate a list of `group_id` values before building a lucene fulltext query.
+///
+/// Port of `graphiti_core/helpers.py::validate_group_ids` @ 34f56e65 (v0.29.1).
+/// `None` (represented here as an empty slice) is accepted without checking.
+/// Each individual id is validated via [`validate_group_id`]; the first invalid
+/// id short-circuits with `DriverError::Query`.
+///
+/// This guard must be called before any interpolation of `group_ids` into a
+/// lucene query string (see [`build_fulltext_query`]) to prevent lucene-injection.
+pub fn validate_group_ids(group_ids: &[String]) -> Result<(), DriverError> {
+    for id in group_ids {
+        validate_group_id(id)?;
+    }
+    Ok(())
+}
+
 /// Lucene special-character escaping, ported from
 /// `graphiti_core/helpers.py::lucene_sanitize`.
 ///
@@ -440,10 +515,22 @@ pub const MAX_QUERY_LENGTH: usize = 128;
 /// - if `len(lucene.split(' ')) + len(group_ids) >= MAX_QUERY_LENGTH`, returns ""
 ///   (empty string) — the caller then short-circuits to no results.
 ///
-/// Returns `None` for the empty-query short-circuit so the caller can return an
-/// empty result set without issuing a Cypher call (matches upstream `if
+/// Returns `Ok(None)` for the empty-query short-circuit so the caller can return
+/// an empty result set without issuing a Cypher call (matches upstream `if
 /// fuzzy_query == '': return []`).
-pub fn build_fulltext_query(query: &str, group_ids: &[String]) -> Option<String> {
+///
+/// Returns `Err(DriverError::Query)` if any `group_id` contains characters
+/// outside `[a-zA-Z0-9_-]` (mirrors upstream `GroupIdValidationError`).
+/// This guard must run before any interpolation of `group_ids` into the lucene
+/// string to close the lucene-injection path.
+pub fn build_fulltext_query(
+    query: &str,
+    group_ids: &[String],
+) -> Result<Option<String>, DriverError> {
+    // Validate before any interpolation — mirrors upstream validate_group_ids()
+    // call site in graphiti_core/helpers.py::validate_group_ids @ 34f56e65.
+    validate_group_ids(group_ids)?;
+
     let mut group_ids_filter = String::new();
     for g in group_ids {
         let clause = format!("group_id:\"{g}\"");
@@ -462,15 +549,19 @@ pub fn build_fulltext_query(query: &str, group_ids: &[String]) -> Option<String>
     // Upstream: len(lucene.split(' ')) + len(group_ids) >= MAX_QUERY_LENGTH -> ''
     let token_count = lucene_query.split(' ').count();
     if token_count + group_ids.len() >= MAX_QUERY_LENGTH {
-        return None;
+        return Ok(None);
     }
 
-    Some(format!("{group_ids_filter}({lucene_query})"))
+    Ok(Some(format!("{group_ids_filter}({lucene_query})")))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------
+    // lucene_sanitize
+    // -----------------------------------------------------------------
 
     #[test]
     fn lucene_escapes_special_chars() {
@@ -494,21 +585,93 @@ mod tests {
         assert_eq!(lucene_sanitize("android"), "android");
     }
 
+    // -----------------------------------------------------------------
+    // validate_group_ids / validate_group_id
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn validate_group_ids_empty_list_passes() {
+        // Empty list == upstream `if group_ids is None: return True`.
+        assert!(validate_group_ids(&[]).is_ok());
+    }
+
+    #[test]
+    fn validate_group_ids_valid_ids_pass() {
+        let ids: Vec<String> = vec![
+            "abc".to_string(),
+            "my-group".to_string(),
+            "group_1".to_string(),
+            "ABC123".to_string(),
+            "a-B_9".to_string(),
+        ];
+        assert!(validate_group_ids(&ids).is_ok());
+    }
+
+    #[test]
+    fn validate_group_id_with_space_is_rejected() {
+        let ids = vec!["bad group".to_string()];
+        let err = validate_group_ids(&ids).unwrap_err();
+        assert!(
+            err.to_string().contains("bad group"),
+            "error message should contain the offending id"
+        );
+        assert!(
+            err.to_string().contains("alphanumeric"),
+            "error message should mention allowed chars"
+        );
+    }
+
+    #[test]
+    fn validate_group_id_with_quote_is_rejected() {
+        // Double-quote is a lucene injection vector inside group_id:"<id>".
+        let ids = vec!["g1\" OR group_id:\"g2".to_string()];
+        let err = validate_group_ids(&ids).unwrap_err();
+        assert!(err.to_string().contains("alphanumeric"));
+    }
+
+    #[test]
+    fn validate_group_id_with_lucene_special_chars_rejected() {
+        for bad in &["g+1", "g:1", "g(1", "g*1", "g?1", "g!1", "g[1", "g^1"] {
+            let ids = vec![bad.to_string()];
+            assert!(
+                validate_group_ids(&ids).is_err(),
+                "expected rejection for: {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_group_id_empty_string_passes() {
+        // Mirrors upstream `if not group_id: return True`.
+        assert!(validate_group_id("").is_ok());
+    }
+
+    // -----------------------------------------------------------------
+    // build_fulltext_query
+    // -----------------------------------------------------------------
+
     #[test]
     fn build_fulltext_query_no_groups() {
-        let q = build_fulltext_query("hello world", &[]).unwrap();
+        let q = build_fulltext_query("hello world", &[])
+            .expect("valid")
+            .unwrap();
         assert_eq!(q, "(hello world)");
     }
 
     #[test]
     fn build_fulltext_query_single_group() {
-        let q = build_fulltext_query("hello", &["g1".to_string()]).unwrap();
+        let q = build_fulltext_query("hello", &["g1".to_string()])
+            .expect("valid")
+            .unwrap();
         assert_eq!(q, "group_id:\"g1\" AND (hello)");
     }
 
     #[test]
     fn build_fulltext_query_multiple_groups_or_chain() {
-        let q = build_fulltext_query("hi", &["g1".to_string(), "g2".to_string()]).unwrap();
+        // Reproduces the upstream OR-precedence quirk bug-for-bug (see module fidelity note).
+        let q = build_fulltext_query("hi", &["g1".to_string(), "g2".to_string()])
+            .expect("valid")
+            .unwrap();
         assert_eq!(q, "group_id:\"g1\" OR group_id:\"g2\" AND (hi)");
     }
 
@@ -516,12 +679,28 @@ mod tests {
     fn build_fulltext_query_too_long_returns_none() {
         // 128 single-char tokens -> token_count == 128 >= MAX_QUERY_LENGTH (128).
         let query = (0..128).map(|_| "x").collect::<Vec<_>>().join(" ");
-        assert!(build_fulltext_query(&query, &[]).is_none());
+        assert!(build_fulltext_query(&query, &[]).expect("valid").is_none());
     }
 
     #[test]
     fn build_fulltext_query_special_chars_are_sanitized_inside() {
-        let q = build_fulltext_query("a+b", &["g".to_string()]).unwrap();
+        let q = build_fulltext_query("a+b", &["g".to_string()])
+            .expect("valid")
+            .unwrap();
         assert_eq!(q, r#"group_id:"g" AND (a\+b)"#);
+    }
+
+    #[test]
+    fn build_fulltext_query_rejects_invalid_group_id() {
+        let err = build_fulltext_query("hello", &["bad group".to_string()]).unwrap_err();
+        assert!(err.to_string().contains("bad group"));
+    }
+
+    #[test]
+    fn build_fulltext_query_rejects_group_id_with_injection_chars() {
+        // Quoted injection attempt — must be rejected before interpolation.
+        let err = build_fulltext_query("search", &["legit\" OR group_id:\"other".to_string()])
+            .unwrap_err();
+        assert!(err.to_string().contains("alphanumeric"));
     }
 }

@@ -25,7 +25,7 @@
 mod convert;
 mod queries;
 
-pub use queries::{MAX_QUERY_LENGTH, build_fulltext_query};
+pub use queries::{MAX_QUERY_LENGTH, build_fulltext_query, validate_group_ids};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -332,7 +332,7 @@ impl SearchOps for Neo4jDriver {
         limit: usize,
     ) -> Result<Vec<EntityEdge>, DriverError> {
         debug!(query_text, limit, "neo4j edge_fulltext_search");
-        let Some(fuzzy) = build_fulltext_query(query_text, group_ids) else {
+        let Some(fuzzy) = build_fulltext_query(query_text, group_ids)? else {
             return Ok(Vec::new());
         };
         let q = query(queries::EDGE_FULLTEXT_SEARCH)
@@ -368,7 +368,7 @@ impl SearchOps for Neo4jDriver {
         limit: usize,
     ) -> Result<Vec<EntityNode>, DriverError> {
         debug!(query_text, limit, "neo4j node_fulltext_search");
-        let Some(fuzzy) = build_fulltext_query(query_text, group_ids) else {
+        let Some(fuzzy) = build_fulltext_query(query_text, group_ids)? else {
             return Ok(Vec::new());
         };
         let q = query(queries::NODE_FULLTEXT_SEARCH)

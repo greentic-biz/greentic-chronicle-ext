@@ -54,6 +54,14 @@ pub enum LlmError {
     Server { status: u16, message: String },
 
     /// JSON deserialization failed (upstream `json.JSONDecodeError`).
+    ///
+    /// NOTE: via `generate_typed` this variant also carries serde *struct*
+    /// mismatches (upstream would classify those as a non-retryable
+    /// `ValidationError`). Do NOT wrap `generate_typed` in `with_retry` —
+    /// retry belongs inside the client's `generate` impl; typing stays
+    /// outside the retry boundary. Splitting this variant into
+    /// retryable-decode vs non-retryable-deserialize is planned for the
+    /// OpenAI client task.
     #[error("invalid JSON: {0}")]
     InvalidJson(#[from] serde_json::Error),
 

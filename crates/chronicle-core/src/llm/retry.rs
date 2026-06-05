@@ -17,8 +17,11 @@ const BACKOFF_MIN_SECS: f64 = 5.0;
 const BACKOFF_MAX_SECS: f64 = 120.0;
 const BACKOFF_MULTIPLIER: f64 = 10.0;
 
-/// Retry an LLM call with randomized exponential backoff (upstream tenacity policy:
-/// up to 4 attempts, wait_random_exponential(multiplier=10, min=5, max=120)).
+/// Retry an LLM call with randomized exponential backoff. Approximates upstream
+/// tenacity `wait_random_exponential(multiplier=10, min=5, max=120)` with up to
+/// 4 attempts. Divergence: draws below the 5s floor collapse to exactly 5s
+/// (a point-mass at the floor) rather than tenacity's continuous lower bound;
+/// operationally equivalent jittered backoff bounded to [5, 120]s.
 pub async fn with_retry<T, F, Fut>(mut call: F) -> Result<T, LlmError>
 where
     F: FnMut() -> Fut,

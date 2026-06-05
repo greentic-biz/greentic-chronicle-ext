@@ -6,8 +6,8 @@ pub enum ChronicleError {
     // Driver(#[from] crate::driver::DriverError),      // enabled in task 8
     #[error("llm error: {0}")]
     Llm(#[from] crate::llm::LlmError),
-    // #[error("embedder error: {0}")]
-    // Embedder(#[from] crate::embedder::EmbedderError), // enabled in task 5
+    #[error("embedder error: {0}")]
+    Embedder(#[from] crate::embedder::EmbedderError),
     #[error("node not found: {uuid}")]
     NodeNotFound { uuid: String },
     #[error("episode not found: {uuid}")]

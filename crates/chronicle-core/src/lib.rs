@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod chronicle;
 pub mod driver;
 pub mod embedder;
 pub mod errors;

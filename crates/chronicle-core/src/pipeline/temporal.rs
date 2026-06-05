@@ -401,4 +401,62 @@ mod tests {
         assert_eq!(new_edge.invalid_at, Some(t(5)));
         assert_eq!(new_edge.expired_at, Some(t(12)));
     }
+
+    // ---- reviewer-derived adversarial tests ----
+
+    #[test]
+    fn existing_with_none_valid_at_never_invalidated() {
+        // existing.valid_at = None: the elif guard requires both edge_valid_at_utc and
+        // resolved_edge_valid_at_utc to be Some, so this edge is never pushed into
+        // invalidated_edges, regardless of existing.invalid_at.
+        //
+        // existing: valid=None, invalid=Some(9)
+        // new edge: valid=Some(5), invalid=None
+        // First skip clause: edge_invalid_at(9) <= new_valid(5)? No (9 > 5).
+        // Second skip clause: new.invalid_at is None → inapplicable.
+        // elif: edge_valid_at is None → match fails → falls through without push.
+        // Result: empty.
+        let new_edge = edge_with(Some(5), None);
+        let mut existing = edge_with(None, Some(9));
+        // Ensure no pre-set expired_at that might interfere with reading the result.
+        existing.expired_at = None;
+        let out = resolve_edge_contradictions(&new_edge, vec![existing], t(12));
+        assert!(out.is_empty(), "expected empty but got {out:?}");
+    }
+
+    #[test]
+    fn new_edge_with_invalid_at_still_invalidates_older() {
+        // A new edge that carries its own invalid_at (finite validity window) must
+        // still invalidate an existing older edge when the intervals genuinely overlap.
+        //
+        // new edge:  valid=Some(5), invalid=Some(10)
+        // existing:  valid=Some(2), invalid=None
+        //
+        // First skip clause: existing.invalid_at is None → inapplicable.
+        // Second skip clause: new.invalid_at(10) <= existing.valid_at(2)? No (10 > 2).
+        // elif: existing.valid_at(2) < new.valid_at(5) → true → invalidate.
+        let new_edge = edge_with(Some(5), Some(10));
+        let existing = edge_with(Some(2), None);
+        let out = resolve_edge_contradictions(&new_edge, vec![existing], t(12));
+        assert_eq!(out.len(), 1, "expected one invalidated edge, got {out:?}");
+        assert_eq!(out[0].invalid_at, Some(t(5)));
+        assert_eq!(out[0].expired_at, Some(t(12)));
+    }
+
+    #[test]
+    fn skip_beats_invalidate_when_both_match() {
+        // The first skip clause must win when it applies, even if the elif would
+        // also trigger on a naive evaluation.
+        //
+        // existing: valid=Some(1), invalid=Some(3)
+        // new edge: valid=Some(5), invalid=None
+        //
+        // First skip clause: existing.invalid_at(3) <= new.valid_at(5)? Yes (3 <= 5) → skip.
+        // (elif: existing.valid_at(1) < new.valid_at(5) would be true, but we never reach it.)
+        // Result: empty.
+        let new_edge = edge_with(Some(5), None);
+        let existing = edge_with(Some(1), Some(3));
+        let out = resolve_edge_contradictions(&new_edge, vec![existing], t(12));
+        assert!(out.is_empty(), "skip clause must win; got {out:?}");
+    }
 }

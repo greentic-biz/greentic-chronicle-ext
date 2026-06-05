@@ -37,6 +37,26 @@
 //   into the prompt via the f-string, which calls `str()` and yields a Python
 //   `repr` (single-quoted keys/values). We reproduce that `repr` shape via
 //   `python_repr_edge_context` so the rendered prompt is byte-faithful.
+//
+// * DOCUMENTED DEVIATION — candidate-input gathering sequential vs upstream
+//   semaphore_gather (resolve_extracted_edges):
+//   Upstream collects (related_edges, existing_edges) pairs inside an asyncio
+//   gather under the shared semaphore, executing all per-edge lookups concurrently
+//   (edge_operations.py:406-430). Phase-1 gathers the pairs in a sequential loop
+//   before the tokio::spawn fan-out. The resulting candidate SET is identical;
+//   only wall-clock throughput differs (sequential I/O vs concurrent). Flagged
+//   for fidelity ledger — no correctness impact, perf concern only.
+//
+// * DOCUMENTED DEVIATION — persist is 4 sequential driver calls vs upstream single
+//   transaction (add_episode.rs persist step):
+//   Upstream graphiti_core wraps the final graph writes (upsert nodes, upsert
+//   edges, invalidate edges, save episode) in a single Neo4j transaction, giving
+//   atomic all-or-nothing semantics. Phase-1 issues 4 sequential driver calls
+//   without an enclosing transaction. Partial failures leave the graph in an
+//   inconsistent state (e.g., nodes written but edges missing). Real Neo4j drivers
+//   (Task 15) MUST consider transactional batching via an explicit session
+//   transaction or a multi-statement Cypher batch. Flagged in the fidelity ledger;
+//   atomicity guarantee is deferred to the neo4j driver implementation.
 
 use std::sync::Arc;
 
@@ -476,9 +496,22 @@ fn python_repr_edge_context(edges: &[EntityEdge], offset: usize) -> String {
     format!("[{}]", items.join(", "))
 }
 
-/// Minimal Python `repr()` for a string: single-quoted, with `\` and `'`
-/// backslash-escaped. Switches to double quotes when the string contains a
-/// single quote but no double quote (matching CPython's repr heuristic).
+/// Reproduce CPython's `unicode_repr()` for a string value.
+///
+/// Quote selection mirrors CPython (Objects/unicodeobject.c `unicode_repr`):
+/// - default: single-quoted `'...'`
+/// - if the string contains `'` but not `"`: double-quoted `"..."`
+/// - if both are present: single-quoted with `'` escaped as `\'`
+///
+/// Character escaping order (CPython priority):
+/// 1. `\` → `\\`
+/// 2. active quote char → `\'` or `\"`
+/// 3. `\n` → `\n`, `\r` → `\r`, `\t` → `\t`
+/// 4. C0 controls (< 0x20) and DEL (0x7f) → `\xNN` (lowercase 2-digit hex)
+/// 5. C1 range 0x80–0xa0 (inclusive) → `\xNN`  (CPython treats these as
+///    non-printable; `unicodedata.category` returns Cc/Cf/Zs for the range;
+///    verified: `repr('\xa0')` → `'\\xa0'`, `repr('\xa1')` → `'¡'`)
+/// 6. All other chars (printable Unicode): pass through verbatim.
 fn python_repr_str(s: &str) -> String {
     let has_single = s.contains('\'');
     let has_double = s.contains('"');
@@ -495,6 +528,15 @@ fn python_repr_str(s: &str) -> String {
             c if c == escape_quote => {
                 out.push('\\');
                 out.push(c);
+            }
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c < '\x20') || c == '\x7f' => {
+                out.push_str(&format!("\\x{:02x}", c as u32));
+            }
+            c if ('\u{0080}'..='\u{00a0}').contains(&c) => {
+                out.push_str(&format!("\\x{:02x}", c as u32));
             }
             c => out.push(c),
         }
@@ -600,6 +642,63 @@ mod tests {
     fn python_repr_str_escapes_when_both_quotes_present() {
         // Contains both ' and " → single-quote with the ' escaped (CPython behaviour).
         assert_eq!(python_repr_str("a'b\"c"), "'a\\'b\"c'");
+    }
+
+    // --- control-character escaping (CPython repr fidelity) ---
+
+    #[test]
+    fn python_repr_str_escapes_newline() {
+        // python3: repr('a\nb') == "'a\\nb'"
+        assert_eq!(python_repr_str("a\nb"), "'a\\nb'");
+    }
+
+    #[test]
+    fn python_repr_str_escapes_tab() {
+        // python3: repr('a\tb') == "'a\\tb'"
+        assert_eq!(python_repr_str("a\tb"), "'a\\tb'");
+    }
+
+    #[test]
+    fn python_repr_str_escapes_carriage_return() {
+        // python3: repr('a\rb') == "'a\\rb'"
+        assert_eq!(python_repr_str("a\rb"), "'a\\rb'");
+    }
+
+    #[test]
+    fn python_repr_str_escapes_nul() {
+        // python3: repr('a\x00b') == "'a\\x00b'"
+        assert_eq!(python_repr_str("a\x00b"), "'a\\x00b'");
+    }
+
+    #[test]
+    fn python_repr_str_escapes_del() {
+        // python3: repr('a\x7fb') == "'a\\x7fb'"
+        assert_eq!(python_repr_str("a\x7fb"), "'a\\x7fb'");
+    }
+
+    #[test]
+    fn python_repr_str_escapes_0x85_nel() {
+        // python3: repr('a\x85b') == "'a\\x85b'"
+        assert_eq!(python_repr_str("a\u{0085}b"), "'a\\x85b'");
+    }
+
+    #[test]
+    fn python_repr_str_escapes_0xa0_nbsp() {
+        // python3: repr('a\xa0b') == "'a\\xa0b'"
+        assert_eq!(python_repr_str("a\u{00a0}b"), "'a\\xa0b'");
+    }
+
+    #[test]
+    fn python_repr_str_passes_through_0xa1_printable() {
+        // python3: repr('\xa1') == "'¡'"  (printable, not escaped)
+        assert_eq!(python_repr_str("\u{00a1}"), "'\u{00a1}'");
+    }
+
+    #[test]
+    fn python_repr_str_mixed_newline_and_apostrophe() {
+        // python3: repr("a\nb'c") == '"a\\nb\'c"'
+        // Has single-quote but no double-quote → double-quoted outer.
+        assert_eq!(python_repr_str("a\nb'c"), "\"a\\nb'c\"");
     }
 
     #[test]

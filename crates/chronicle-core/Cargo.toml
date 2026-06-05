@@ -1,0 +1,24 @@
+[package]
+name = "chronicle-core"
+description = "Bi-temporal knowledge-graph memory core (Rust port of graphiti-core)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+tokio.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+schemars.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+blake2.workspace = true
+tracing.workspace = true
+rand.workspace = true
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "test-util"] }

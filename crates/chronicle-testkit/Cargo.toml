@@ -1,0 +1,15 @@
+[package]
+name = "chronicle-testkit"
+description = "Deterministic test doubles for chronicle-core (in-memory driver, scripted LLM)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+chronicle-core.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+serde_json.workspace = true
+chrono.workspace = true

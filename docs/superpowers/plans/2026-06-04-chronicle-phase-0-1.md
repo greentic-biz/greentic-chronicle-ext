@@ -955,17 +955,15 @@ pub trait EntityNodeOps: Send + Sync {
 pub trait EntityEdgeOps: Send + Sync {
     async fn save_entity_edges(&self, edges: &[EntityEdge]) -> Result<(), DriverError>;
     async fn get_entity_edge(&self, uuid: &str) -> Result<Option<EntityEdge>, DriverError>;
-    /// Edges between the two nodes (either direction) — dedup candidates.
+    /// Edges from source_uuid -> target_uuid (single direction, mirrors upstream
+    /// EntityEdge.get_between_nodes). Node-pair duplicate-candidate pool.
+    /// AMENDED during Task 8 review: upstream v0.29.1 has NO topology-based
+    /// "edges touching nodes" lookup — invalidation candidates come from hybrid
+    /// fact-search in pipeline code (see Task 14 amendment).
     async fn get_edges_between_nodes(
         &self,
         source_uuid: &str,
         target_uuid: &str,
-    ) -> Result<Vec<EntityEdge>, DriverError>;
-    /// All non-expired edges touching any of the given nodes — invalidation candidates.
-    async fn get_edges_touching_nodes(
-        &self,
-        node_uuids: &[String],
-        group_id: &str,
     ) -> Result<Vec<EntityEdge>, DriverError>;
 }
 
@@ -1149,7 +1147,7 @@ impl EmbedderClient for MockEmbedder {
 - `*_fulltext_search`: case-insensitive substring match on `name`/`fact`/`summary`/`content`, group-filtered, truncate to limit.
 - `*_similarity_search`: brute-force cosine against stored embeddings, filter `> min_score`, sort desc, truncate.
 - `retrieve_episodes`: filter `valid_at <= reference_time` + group + optional source, sort by valid_at desc, take n, reverse (chronological) — mirror upstream exactly.
-- `get_edges_touching_nodes`: edges whose source or target is in `node_uuids`, same group, `expired_at.is_none()`.
+- (AMENDED Task 8 review: no `get_edges_touching_nodes` — method removed from the trait; invalidation candidates are produced by hybrid fact-search in pipeline code.)
 
 Write the cosine helper once:
 ```rust
@@ -1897,8 +1895,12 @@ pub async fn resolve_extracted_edges(
     nodes: &[EntityNode],
 ) -> Result<EdgeResolutionOutcome, ChronicleError>;
 ```
-`resolve_extracted_edge` per-edge flow (parallel via semaphore, mirror upstream):
-1. Fetch `related_edges` (same node pair) + `existing_edges` (touching either node) from driver.
+`resolve_extracted_edge` per-edge flow (parallel via semaphore, mirror upstream — AMENDED after verifying upstream v0.29.1 edge_operations.py lines 355-425):
+1. Candidate retrieval (in `resolve_extracted_edges`, before the per-edge loop):
+   a. Embed extracted edge facts FIRST (`create_entity_edge_embeddings` analog — cosine search needs fact embeddings).
+   b. `valid_edges` per extracted edge = `driver.get_edges_between_nodes(source, target)` (node-pair pool).
+   c. `related_edges` per edge = upstream re-ranks the pair pool via `EDGE_HYBRID_SEARCH_RRF` + `SearchFilters(edge_uuids=pair pool)`. Phase-1 approximation: use the pair pool directly, capped at RELEVANT_SCHEMA_LIMIT — candidate ORDERING may differ from upstream (the LLM sees the same candidate set; ordering deviation goes in the fidelity ledger).
+   d. `existing_edges` (invalidation candidates) per edge = `edge_search(driver, embedder, &edge.fact, &[group_id], &edge_hybrid_search_rrf())` (Task 12 fn — faithful to upstream), minus any uuid already in `related_edges`.
 2. Fast path both empty → extract timestamps (`extract_edges::extract_timestamps`, small model) → return as-is.
 3. Fast path exact fact match (normalized) → append episode uuid, return existing edge.
 4. Else LLM `dedupe_edges::resolve_edge` → `EdgeDuplicate`; first valid duplicate idx wins; map `contradicted_facts` indices to candidates (related first, then existing, continuous indexing).
@@ -2030,7 +2032,7 @@ ORDER BY score DESC
 LIMIT $limit
 "#;
 ```
-Plus episode save/get/retrieve, MENTIONS save, node fulltext (`node_name_and_summary` index) and node similarity (`vector.similarity.cosine(n.name_embedding, …)`), `get_edges_between_nodes` / `get_edges_touching_nodes` MATCH queries — copy the SELECT column lists from `graphiti_core/models/edges/edge_db_queries.py` exactly.
+Plus episode save/get/retrieve, MENTIONS save, node fulltext (`node_name_and_summary` index) and node similarity (`vector.similarity.cosine(n.name_embedding, …)`), and the `get_edges_between_nodes` MATCH query (single direction `(n)-[e:RELATES_TO]->(m)`; `get_edges_touching_nodes` was removed from the trait in the Task 8 amendment) — copy the SELECT column lists from `graphiti_core/models/edges/edge_db_queries.py` exactly.
 
 **Fulltext query sanitation** (upstream `build_fulltext_query`): escape Lucene specials `+ - & | ! ( ) { } [ ] ^ " ~ * ? : \ /`, prefix `group_id:"<gid>" AND (…)`; cap at 128 tokens → return empty results instead of erroring.
 

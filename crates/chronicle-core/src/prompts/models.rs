@@ -4,6 +4,12 @@
 //   - graphiti_core/prompts/dedupe_nodes.py   @ 34f56e65 (v0.29.1)
 //   - graphiti_core/prompts/dedupe_edges.py   @ 34f56e65 (v0.29.1)
 //   - graphiti_core/prompts/summarize_nodes.py @ 34f56e65 (v0.29.1)
+//
+// Serde contract: NO `deny_unknown_fields` anywhere in this module — LLMs may
+// return extra fields; serde silently ignoring them is intentional tolerance.
+// Do not "harden" these structs with deny_unknown_fields.
+// Fields without a #[schemars(description)] mirror upstream fields that have
+// no Field(description=...) — do not invent descriptions (verbatim rule).
 
 // --------------------------------------------------------------------------
 // Helpers

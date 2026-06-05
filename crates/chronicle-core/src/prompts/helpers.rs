@@ -8,5 +8,8 @@ pub const DO_NOT_ESCAPE_UNICODE: &str = "\nDo not escape unicode characters.\n";
 /// serde_json::to_string already preserves non-ASCII characters by default (no escaping),
 /// matching the Python json.dumps(data, ensure_ascii=False, indent=None) behaviour.
 pub fn to_prompt_json<T: serde::Serialize>(value: &T) -> String {
-    serde_json::to_string(value).unwrap_or_else(|_| "null".to_string())
+    serde_json::to_string(value).unwrap_or_else(|err| {
+        tracing::error!(error = %err, "to_prompt_json serialization failed; emitting null");
+        "null".to_string()
+    })
 }

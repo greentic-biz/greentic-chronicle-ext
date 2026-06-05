@@ -17,8 +17,10 @@ use crate::prompts::helpers::{DO_NOT_ESCAPE_UNICODE, to_prompt_json};
 
 /// Context for [`nodes`].
 pub struct NodesContext<'a> {
-    /// Upstream `context['previous_episodes']`, rendered via to_prompt_json.
-    pub previous_episodes: &'a [String],
+    /// Upstream `context['previous_episodes']` — a JSON array of
+    /// `{"content": ..., "timestamp": ...}` objects (see
+    /// `pipeline::node_ops::previous_episodes_context`), rendered via to_prompt_json.
+    pub previous_episodes: &'a serde_json::Value,
     /// Upstream `context['episode_content']`.
     pub episode_content: &'a str,
     /// Upstream `context['extracted_nodes']`, rendered via to_prompt_json. The slice
@@ -35,7 +37,7 @@ pub fn nodes(ctx: &NodesContext<'_>) -> Vec<Message> {
 NEVER fabricate entity names or mark distinct entities as duplicates.{DO_NOT_ESCAPE_UNICODE}"
     );
 
-    let previous_episodes = to_prompt_json(&ctx.previous_episodes);
+    let previous_episodes = to_prompt_json(ctx.previous_episodes);
     let episode_content = ctx.episode_content;
     let extracted_nodes = to_prompt_json(ctx.extracted_nodes);
     let existing_nodes = to_prompt_json(ctx.existing_nodes);
@@ -120,7 +122,8 @@ mod tests {
 
     #[test]
     fn nodes_renders_verbatim() {
-        let prev = vec!["Sam: hi".to_string()];
+        let prev =
+            serde_json::json!([{"content": "Sam: hi", "timestamp": "2025-04-29T00:00:00+00:00"}]);
         let extracted = serde_json::json!([{"id": 0, "name": "Sam"}, {"id": 1, "name": "NYC"}]);
         let existing = serde_json::json!([{"candidate_id": 0, "name": "Sam"}]);
         let ctx = NodesContext {

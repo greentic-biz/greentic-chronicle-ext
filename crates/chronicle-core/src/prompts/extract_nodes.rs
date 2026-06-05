@@ -11,8 +11,10 @@
 //   is impossible in Rust; we render it via to_prompt_json (JSON, double-quoted). The
 //   surrounding prompt text is byte-identical. This is the one documented value-rendering
 //   divergence; see the project fidelity ledger.
-// - `previous_episodes` is rendered with to_prompt_json (upstream calls
-//   to_prompt_json([ep for ep in context['previous_episodes']])).
+// - `previous_episodes` is the already-built JSON array of
+//   `{"content": ..., "timestamp": ...}` objects (see
+//   `pipeline::node_ops::previous_episodes_context`), rendered with to_prompt_json
+//   (upstream calls to_prompt_json([ep for ep in context['previous_episodes']])).
 // - `custom_extraction_instructions` is the already-resolved string the caller passes
 //   (upstream computes `custom_extraction_instructions or ''` at the call site), so the
 //   context field carries the final text (empty string when absent).
@@ -24,8 +26,10 @@ use crate::prompts::helpers::{DO_NOT_ESCAPE_UNICODE, to_prompt_json};
 pub struct ExtractMessageContext<'a> {
     /// Upstream `context['entity_types']` (a `list[dict]` rendered raw upstream).
     pub entity_types: &'a serde_json::Value,
-    /// Upstream `context['previous_episodes']`, rendered via to_prompt_json.
-    pub previous_episodes: &'a [String],
+    /// Upstream `context['previous_episodes']` — a JSON array of
+    /// `{"content": ..., "timestamp": ...}` objects (see
+    /// `pipeline::node_ops::previous_episodes_context`), rendered via to_prompt_json.
+    pub previous_episodes: &'a serde_json::Value,
     /// Upstream `context['episode_content']`.
     pub episode_content: &'a str,
     /// Upstream `context['custom_extraction_instructions']` (already resolved to ''
@@ -41,7 +45,7 @@ NEVER extract abstract concepts, feelings, or generic words.{DO_NOT_ESCAPE_UNICO
     );
 
     let entity_types = to_prompt_json(ctx.entity_types);
-    let previous_episodes = to_prompt_json(&ctx.previous_episodes);
+    let previous_episodes = to_prompt_json(ctx.previous_episodes);
     let episode_content = ctx.episode_content;
     let custom_extraction_instructions = ctx.custom_extraction_instructions;
 
@@ -338,8 +342,10 @@ Do NOT extract: "pic" (generic media noun), "event" (generic event noun), "baske
 
 /// Context for [`extract_attributes`].
 pub struct ExtractAttributesContext<'a> {
-    /// Upstream `context['previous_episodes']`, rendered via to_prompt_json.
-    pub previous_episodes: &'a [String],
+    /// Upstream `context['previous_episodes']` — a JSON array of
+    /// `{"content": ..., "timestamp": ...}` objects (see
+    /// `pipeline::node_ops::previous_episodes_context`), rendered via to_prompt_json.
+    pub previous_episodes: &'a serde_json::Value,
     /// Upstream `context['episode_content']`, rendered via to_prompt_json.
     pub episode_content: &'a serde_json::Value,
     /// Upstream `context['node']` is a Python `dict` interpolated RAW (`{context['node']}`),
@@ -359,7 +365,7 @@ already present on the ENTITY. You output strictly the JSON specified by the \
 response schema — no reasoning, no explanation, no commentary in any field.{DO_NOT_ESCAPE_UNICODE}"
     );
 
-    let previous_episodes = to_prompt_json(&ctx.previous_episodes);
+    let previous_episodes = to_prompt_json(ctx.previous_episodes);
     let episode_content = to_prompt_json(ctx.episode_content);
     let node = to_prompt_json(ctx.node);
 
@@ -449,7 +455,7 @@ mod tests {
 
     #[test]
     fn extract_message_renders_verbatim() {
-        let prev = vec!["Jordan: hi".to_string()];
+        let prev = serde_json::json!([{"content": "Jordan: hi", "timestamp": "2025-04-29T00:00:00+00:00"}]);
         let ctx = ExtractMessageContext {
             entity_types: &entity_types(),
             previous_episodes: &prev,
@@ -532,7 +538,7 @@ mod tests {
 
     #[test]
     fn extract_attributes_renders_verbatim() {
-        let prev = vec!["Mary: hello".to_string()];
+        let prev = serde_json::json!([{"content": "Mary: hello", "timestamp": "2025-04-29T00:00:00+00:00"}]);
         let episode = serde_json::json!("Mary works at Acme.");
         let node = serde_json::json!({"name": "Mary"});
         let ctx = ExtractAttributesContext {

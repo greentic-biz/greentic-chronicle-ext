@@ -29,12 +29,12 @@
 //
 // * `previous_episodes` context shape: upstream builds
 //   `[{'content': ep.content, 'timestamp': ep.valid_at.isoformat()} ...]` and
-//   renders the whole list via `to_prompt_json`. Our Task-7 prompt fns take
-//   `&[String]` and render `to_prompt_json(&[String])` → a JSON array of
-//   strings, NOT objects. That is a locked signature-level divergence from
-//   Task 7; the pipeline passes `ep.content` per previous episode (the
-//   substantive value), which is the closest achievable byte-match given the
-//   fixed `&[String]` signature. Documented in the fidelity ledger.
+//   renders the whole list via `to_prompt_json`. We reproduce this exactly via
+//   [`previous_episodes_context`], which the prompt fns now consume as a
+//   `&serde_json::Value` (a JSON array of `{content, timestamp}` objects). The
+//   `timestamp` matches Python `datetime.isoformat()` byte-for-byte (see
+//   [`crate::helpers::isoformat`]). This was previously a `&[String]`
+//   content-only divergence; it is now byte-identical to upstream.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -42,7 +42,7 @@ use std::sync::Arc;
 use serde_json::{Value, json};
 
 use crate::errors::ChronicleError;
-use crate::helpers::utc_now;
+use crate::helpers::{isoformat, utc_now};
 use crate::llm::{LlmRequest, generate_typed};
 use crate::pipeline::clients::Clients;
 use crate::pipeline::dedup_helpers::{
@@ -150,15 +150,34 @@ fn labels_for(entity_type_name: &str) -> Vec<String> {
     }
 }
 
-/// Render the `previous_episodes` context value the pipeline feeds to the
-/// prompt fns. See the module-level FIDELITY NOTE: upstream builds a
-/// `list[dict]`, but the locked `&[String]` prompt signature can only carry the
-/// content strings, so we pass `ep.content`.
-fn previous_episode_strings(previous_episodes: &[EpisodicNode]) -> Vec<String> {
-    previous_episodes
-        .iter()
-        .map(|ep| ep.content.clone())
-        .collect()
+/// Build the `previous_episodes` context value the pipeline feeds to the prompt
+/// fns, byte-identical to upstream. Upstream (node_operations.py / edge_operations.py /
+/// combined_extraction.py) builds, at every prompt call site:
+///
+/// ```python
+/// [
+///     {'content': ep.content, 'timestamp': ep.valid_at.isoformat() if ep.valid_at else None}
+///     for ep in previous_episodes
+/// ]
+/// ```
+///
+/// Key order (`content` then `timestamp`) and the `isoformat()` timestamp format
+/// are reproduced exactly (see [`crate::helpers::isoformat`]). NOTE: our
+/// `EpisodicNode::valid_at` is a non-optional `DateTime<Utc>`, so `timestamp` is
+/// always a string here — the upstream `if ep.valid_at else None` branch is
+/// unreachable given our type, which is strictly more information, never less.
+pub fn previous_episodes_context(previous_episodes: &[EpisodicNode]) -> Value {
+    Value::Array(
+        previous_episodes
+            .iter()
+            .map(|ep| {
+                json!({
+                    "content": ep.content,
+                    "timestamp": isoformat(ep.valid_at),
+                })
+            })
+            .collect(),
+    )
 }
 
 /// Extract entity nodes from a single episode.
@@ -174,7 +193,7 @@ pub async fn extract_nodes(
     custom_extraction_instructions: Option<&str>,
 ) -> Result<Vec<EntityNode>, ChronicleError> {
     let entity_types_context = build_entity_types_context(entity_types);
-    let prev = previous_episode_strings(previous_episodes);
+    let prev = previous_episodes_context(previous_episodes);
     // Upstream resolves `custom_extraction_instructions or ''` at the call site;
     // single-episode path adds no episode_attribution suffix.
     let custom = custom_extraction_instructions.unwrap_or("");
@@ -551,7 +570,7 @@ async fn resolve_with_llm(
         })
         .collect();
 
-    let prev = previous_episode_strings(previous_episodes);
+    let prev = previous_episodes_context(previous_episodes);
     let extracted_value = Value::Array(extracted_nodes_context);
     let existing_value = Value::Array(existing_nodes_context);
 

@@ -18,8 +18,10 @@ use crate::prompts::snippets::SUMMARY_INSTRUCTIONS;
 
 /// Context for [`summarize_context`].
 pub struct SummarizeContext<'a> {
-    /// Upstream `context['previous_episodes']`, rendered via to_prompt_json.
-    pub previous_episodes: &'a [String],
+    /// Upstream `context['previous_episodes']` — a JSON array of
+    /// `{"content": ..., "timestamp": ...}` objects (see
+    /// `pipeline::node_ops::previous_episodes_context`), rendered via to_prompt_json.
+    pub previous_episodes: &'a serde_json::Value,
     /// Upstream `context['episode_content']`, rendered via to_prompt_json.
     pub episode_content: &'a serde_json::Value,
     /// Upstream `context['node_name']` (interpolated raw).
@@ -37,7 +39,7 @@ pub fn summarize_context(ctx: &SummarizeContext<'_>) -> Vec<Message> {
     );
 
     let summary_instructions = SUMMARY_INSTRUCTIONS;
-    let previous_episodes = to_prompt_json(&ctx.previous_episodes);
+    let previous_episodes = to_prompt_json(ctx.previous_episodes);
     let episode_content = to_prompt_json(ctx.episode_content);
     let node_name = ctx.node_name;
     let node_summary = ctx.node_summary;
@@ -84,7 +86,8 @@ mod tests {
 
     #[test]
     fn summarize_context_renders_verbatim() {
-        let prev = vec!["Mina: hi".to_string()];
+        let prev =
+            serde_json::json!([{"content": "Mina: hi", "timestamp": "2025-04-29T00:00:00+00:00"}]);
         let episode = serde_json::json!("Jordan presented a ceramics workshop.");
         let attributes = serde_json::json!({"role": "instructor"});
         let ctx = SummarizeContext {

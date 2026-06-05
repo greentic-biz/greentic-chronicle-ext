@@ -20,8 +20,10 @@ use crate::prompts::helpers::{DO_NOT_ESCAPE_UNICODE, to_prompt_json};
 
 /// Context for [`edge`].
 pub struct EdgeContext<'a> {
-    /// Upstream `context['previous_episodes']`, rendered via to_prompt_json.
-    pub previous_episodes: &'a [String],
+    /// Upstream `context['previous_episodes']` — a JSON array of
+    /// `{"content": ..., "timestamp": ...}` objects (see
+    /// `pipeline::node_ops::previous_episodes_context`), rendered via to_prompt_json.
+    pub previous_episodes: &'a serde_json::Value,
     /// Upstream `context['episode_content']`.
     pub episode_content: &'a str,
     /// Upstream `context['nodes']`, rendered via to_prompt_json.
@@ -60,7 +62,7 @@ Use each episode's timestamp to resolve temporal references within that episode.
 REFERENCE_TIME is a fallback for when no per-episode timestamp is available.{DO_NOT_ESCAPE_UNICODE}"
     );
 
-    let previous_episodes = to_prompt_json(&ctx.previous_episodes);
+    let previous_episodes = to_prompt_json(ctx.previous_episodes);
     let episode_content = ctx.episode_content;
     let nodes = to_prompt_json(ctx.nodes);
     let reference_time = ctx.reference_time;
@@ -202,7 +204,8 @@ mod tests {
 
     #[test]
     fn edge_renders_verbatim_with_fact_types() {
-        let prev = vec!["Alice: hi".to_string()];
+        let prev =
+            serde_json::json!([{"content": "Alice: hi", "timestamp": "2025-04-29T00:00:00+00:00"}]);
         let nodes = serde_json::json!([{"name": "Alice"}, {"name": "Acme Corp"}]);
         let edge_types = serde_json::json!([{"fact_type_name": "WORKS_AT"}]);
         let ctx = EdgeContext {
@@ -238,7 +241,7 @@ mod tests {
 
     #[test]
     fn edge_omits_fact_types_when_absent() {
-        let prev: Vec<String> = vec![];
+        let prev = serde_json::json!([]);
         let nodes = serde_json::json!([{"name": "Alice"}]);
         let ctx = EdgeContext {
             previous_episodes: &prev,
@@ -258,7 +261,7 @@ mod tests {
 
     #[test]
     fn edge_omits_fact_types_when_empty_list() {
-        let prev: Vec<String> = vec![];
+        let prev = serde_json::json!([]);
         let nodes = serde_json::json!([{"name": "Alice"}]);
         let empty = serde_json::json!([]);
         let ctx = EdgeContext {
@@ -276,7 +279,7 @@ mod tests {
     #[test]
     fn zero_number_suppresses_fact_types_block() {
         // Python truthiness: bool(0) == False → FACT_TYPES should be omitted.
-        let prev: Vec<String> = vec![];
+        let prev = serde_json::json!([]);
         let nodes = serde_json::json!([{"name": "Alice"}]);
         let zero = serde_json::json!(0);
         let ctx = EdgeContext {
@@ -294,7 +297,7 @@ mod tests {
     #[test]
     fn nonzero_number_keeps_fact_types_block() {
         // Python truthiness: bool(1) == True → FACT_TYPES should be present.
-        let prev: Vec<String> = vec![];
+        let prev = serde_json::json!([]);
         let nodes = serde_json::json!([{"name": "Alice"}]);
         let one = serde_json::json!(1);
         let ctx = EdgeContext {

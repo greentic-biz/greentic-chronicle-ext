@@ -35,19 +35,16 @@ pub trait EntityNodeOps: Send + Sync {
 pub trait EntityEdgeOps: Send + Sync {
     async fn save_entity_edges(&self, edges: &[EntityEdge]) -> Result<(), DriverError>;
     async fn get_entity_edge(&self, uuid: &str) -> Result<Option<EntityEdge>, DriverError>;
-    /// Edges between the two nodes (either direction) — dedup candidates
-    /// (upstream related_edges in resolve_extracted_edge).
+    /// Edges from source_uuid -> target_uuid (single direction, mirrors upstream
+    /// EntityEdge.get_between_nodes / Neo4j MATCH (n)-[e:RELATES_TO]->(m)).
+    /// Used as the node-pair duplicate-candidate pool in resolve_extracted_edges;
+    /// upstream additionally re-ranks this pool via hybrid search
+    /// (EDGE_HYBRID_SEARCH_RRF + SearchFilters(edge_uuids=...)) — that re-ranking
+    /// happens in pipeline code, not in the driver.
     async fn get_edges_between_nodes(
         &self,
         source_uuid: &str,
         target_uuid: &str,
-    ) -> Result<Vec<EntityEdge>, DriverError>;
-    /// Non-expired edges touching any of the given nodes — invalidation
-    /// candidates (upstream existing_edges in resolve_extracted_edge).
-    async fn get_edges_touching_nodes(
-        &self,
-        node_uuids: &[String],
-        group_id: &str,
     ) -> Result<Vec<EntityEdge>, DriverError>;
 }
 
@@ -61,6 +58,7 @@ pub trait EpisodeOps: Send + Sync {
     ) -> Result<Vec<EpisodicNode>, DriverError>;
     /// Last-n episodes with valid_at <= reference_time, returned in
     /// chronological order (upstream retrieve_episodes).
+    /// Tie order for equal valid_at values is backend-dependent (upstream has no secondary sort key).
     async fn retrieve_episodes(
         &self,
         reference_time: DateTime<Utc>,
@@ -159,14 +157,6 @@ mod tests {
             &self,
             _source_uuid: &str,
             _target_uuid: &str,
-        ) -> Result<Vec<EntityEdge>, DriverError> {
-            Ok(vec![])
-        }
-
-        async fn get_edges_touching_nodes(
-            &self,
-            _node_uuids: &[String],
-            _group_id: &str,
         ) -> Result<Vec<EntityEdge>, DriverError> {
             Ok(vec![])
         }

@@ -6,10 +6,7 @@
 // Phase-2 additions: NodeSearchConfig, EpisodeSearchConfig, full reranker enums,
 //   NodeSearchMethod, EpisodeSearchMethod, SearchConfig gains node_config/episode_config.
 //
-// Community scope: CommunitySearchConfig type is defined here for structural parity
-//   with upstream, but SearchConfig.community_config is always None in shipped recipes.
-//   Full community search is deferred to Phase 4.
-// community scope deferred to Phase 4; combined recipes ship without it (ledger)
+// community scope deferred to Phase 4 (upstream community_config; needs CommunityNode storage + CommunitySearchMethod enum) — ledger
 
 /// Upstream DEFAULT_SEARCH_LIMIT (search_config.py).
 pub const DEFAULT_SEARCH_LIMIT: usize = 10;
@@ -89,15 +86,6 @@ pub enum EpisodeReranker {
     CrossEncoder,
 }
 
-/// Upstream `CommunityReranker` enum (search_config.py).
-/// Defined for structural parity; community scope deferred to Phase 4.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CommunityReranker {
-    Rrf,
-    Mmr,
-    CrossEncoder,
-}
-
 // ── Per-scope search configs ─────────────────────────────────────────────────
 
 /// Upstream `EdgeSearchConfig` model (search_config.py).
@@ -174,19 +162,6 @@ impl Default for EpisodeSearchConfig {
     }
 }
 
-/// Upstream `CommunitySearchConfig` model (search_config.py).
-/// Defined for structural parity with upstream; the `community_config` field on
-/// `SearchConfig` is always `None` in shipped recipes (Phase 4 deferred).
-// community scope deferred to Phase 4; combined recipes ship without it (ledger)
-#[derive(Debug, Clone)]
-pub struct CommunitySearchConfig {
-    pub search_methods: Vec<EdgeSearchMethod>, // community uses cosine + bm25 like edges
-    pub reranker: CommunityReranker,
-    pub sim_min_score: f32,
-    pub mmr_lambda: f64,
-    pub bfs_max_depth: usize,
-}
-
 // ── Top-level SearchConfig ───────────────────────────────────────────────────
 
 /// Top-level search configuration passed to the search functions.
@@ -206,10 +181,7 @@ pub struct SearchConfig {
     /// Episode search sub-config. `None` skips episode search.
     /// Phase-2 addition.
     pub episode_config: Option<EpisodeSearchConfig>,
-    /// Community search sub-config. Always `None` in shipped recipes.
-    /// Phase 4 deferred.
-    // community scope deferred to Phase 4; combined recipes ship without it (ledger)
-    pub community_config: Option<CommunitySearchConfig>,
+    // community scope deferred to Phase 4 (upstream community_config; needs CommunityNode storage + CommunitySearchMethod enum) — ledger
     /// Maximum number of results to return after reranking.
     pub limit: usize,
     /// Minimum reranker score to include in final output.
@@ -230,7 +202,6 @@ pub fn edge_hybrid_search_rrf() -> SearchConfig {
         edge_config: Some(EdgeSearchConfig::default()),
         node_config: None,
         episode_config: None,
-        community_config: None,
         limit: DEFAULT_SEARCH_LIMIT,
         reranker_min_score: 0.0,
     }
@@ -279,7 +250,6 @@ mod tests {
         assert!(cfg.edge_config.is_some());
         assert!(cfg.node_config.is_none());
         assert!(cfg.episode_config.is_none());
-        assert!(cfg.community_config.is_none());
         assert_eq!(cfg.limit, DEFAULT_SEARCH_LIMIT);
         assert_eq!(cfg.reranker_min_score, 0.0);
     }
@@ -298,6 +268,5 @@ mod tests {
         // Verify Phase-2 fields exist and are None by default for backward-compat recipe.
         let _ = cfg.node_config;
         let _ = cfg.episode_config;
-        let _ = cfg.community_config;
     }
 }

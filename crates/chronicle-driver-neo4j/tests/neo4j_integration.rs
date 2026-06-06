@@ -14,6 +14,7 @@
 use chronicle_core::driver::{
     EntityEdgeOps, EntityNodeOps, EpisodeOps, EpisodicEdgeOps, GraphDriver, SchemaOps, SearchOps,
 };
+use chronicle_core::search::filters::SearchFilters;
 use chronicle_core::types::{EntityEdge, EntityNode, EpisodeType, EpisodicEdge, EpisodicNode};
 use chronicle_driver_neo4j::Neo4jDriver;
 use chrono::{Duration, Utc};
@@ -380,14 +381,24 @@ async fn fulltext_search_finds_edge_by_fact_word() {
 
     // Node fulltext: search "Alice"
     let nodes = d
-        .node_fulltext_search("Alice", std::slice::from_ref(&group), 10)
+        .node_fulltext_search(
+            "Alice",
+            &SearchFilters::default(),
+            std::slice::from_ref(&group),
+            10,
+        )
         .await
         .expect("node fts");
     assert!(nodes.iter().any(|n| n.uuid == a.uuid));
 
     // Edge fulltext: search by a distinctive fact word
     let edges = d
-        .edge_fulltext_search("employed", std::slice::from_ref(&group), 10)
+        .edge_fulltext_search(
+            "employed",
+            &SearchFilters::default(),
+            std::slice::from_ref(&group),
+            10,
+        )
         .await
         .expect("edge fts");
     assert!(edges.iter().any(|e| e.uuid == edge.uuid));
@@ -428,13 +439,25 @@ async fn similarity_search_with_real_vector() {
 
     // Query vector nearly identical to node embedding -> high cosine.
     let node_hits = d
-        .node_similarity_search(&[1.0, 0.0, 0.0], std::slice::from_ref(&group), 10, 0.5)
+        .node_similarity_search(
+            &[1.0, 0.0, 0.0],
+            &SearchFilters::default(),
+            std::slice::from_ref(&group),
+            10,
+            0.5,
+        )
         .await
         .expect("node sim");
     assert!(node_hits.iter().any(|n| n.uuid == node.uuid));
 
     let edge_hits = d
-        .edge_similarity_search(&[0.0, 1.0, 0.0], std::slice::from_ref(&group), 10, 0.5)
+        .edge_similarity_search(
+            &[0.0, 1.0, 0.0],
+            &SearchFilters::default(),
+            std::slice::from_ref(&group),
+            10,
+            0.5,
+        )
         .await
         .expect("edge sim");
     assert!(edge_hits.iter().any(|e| e.uuid == edge.uuid));

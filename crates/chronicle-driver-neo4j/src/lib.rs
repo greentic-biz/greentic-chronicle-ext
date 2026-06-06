@@ -32,10 +32,13 @@ use chrono::{DateTime, Utc};
 use neo4rs::{Graph, Query, query};
 use tracing::debug;
 
+use std::collections::HashMap;
+
 use chronicle_core::driver::{
     DriverError, EntityEdgeOps, EntityNodeOps, EpisodeOps, EpisodicEdgeOps, GraphDriver, SchemaOps,
     SearchOps,
 };
+use chronicle_core::search::filters::SearchFilters;
 use chronicle_core::types::{EntityEdge, EntityNode, EpisodeType, EpisodicEdge, EpisodicNode};
 
 /// Neo4j-backed `GraphDriver`.
@@ -325,9 +328,18 @@ impl EpisodicEdgeOps for Neo4jDriver {
 
 #[async_trait]
 impl SearchOps for Neo4jDriver {
+    // NOTE (Phase-2 Task 6): the `filters: &SearchFilters` param is threaded
+    // through the four existing search methods for signature parity, but the
+    // full SearchFilters WHERE construction (edge_types / edge_uuids / node_labels
+    // / date OR-of-ANDs groups) lands in Task 6 against the query templates in
+    // `queries.rs`. To avoid a partial-filter footgun (silently applying only
+    // some predicates while a caller believes all are honored), the param content
+    // is intentionally IGNORED here until Task 6 wires every predicate. The
+    // FakeDriver already honors the full SearchFilters surface for unit tests.
     async fn edge_fulltext_search(
         &self,
         query_text: &str,
+        _filters: &SearchFilters,
         group_ids: &[String],
         limit: usize,
     ) -> Result<Vec<EntityEdge>, DriverError> {
@@ -346,10 +358,12 @@ impl SearchOps for Neo4jDriver {
     async fn edge_similarity_search(
         &self,
         search_vector: &[f32],
+        _filters: &SearchFilters,
         group_ids: &[String],
         limit: usize,
         min_score: f32,
     ) -> Result<Vec<EntityEdge>, DriverError> {
+        // filters applied fully in Task 6 (see SearchOps impl note above).
         debug!(limit, min_score, "neo4j edge_similarity_search");
         let vector: Vec<f64> = search_vector.iter().map(|f| *f as f64).collect();
         let q = query(queries::EDGE_SIMILARITY_SEARCH)
@@ -364,9 +378,11 @@ impl SearchOps for Neo4jDriver {
     async fn node_fulltext_search(
         &self,
         query_text: &str,
+        _filters: &SearchFilters,
         group_ids: &[String],
         limit: usize,
     ) -> Result<Vec<EntityNode>, DriverError> {
+        // filters applied fully in Task 6 (see SearchOps impl note above).
         debug!(query_text, limit, "neo4j node_fulltext_search");
         let Some(fuzzy) = build_fulltext_query(query_text, group_ids)? else {
             return Ok(Vec::new());
@@ -382,10 +398,12 @@ impl SearchOps for Neo4jDriver {
     async fn node_similarity_search(
         &self,
         search_vector: &[f32],
+        _filters: &SearchFilters,
         group_ids: &[String],
         limit: usize,
         min_score: f32,
     ) -> Result<Vec<EntityNode>, DriverError> {
+        // filters applied fully in Task 6 (see SearchOps impl note above).
         debug!(limit, min_score, "neo4j node_similarity_search");
         let vector: Vec<f64> = search_vector.iter().map(|f| *f as f64).collect();
         let q = query(queries::NODE_SIMILARITY_SEARCH)
@@ -395,6 +413,98 @@ impl SearchOps for Neo4jDriver {
             .param("min_score", min_score as f64);
         let rows = self.fetch_rows(q, "node_similarity_search").await?;
         rows.iter().map(convert::entity_node_from_row).collect()
+    }
+
+    // ── Phase-2 search primitives (functional Cypher lands in Task 6) ─────────
+    //
+    // These return an explicit `DriverError::Query` rather than a silent empty
+    // result so that any caller reaching them before Task 6 fails loudly instead
+    // of receiving wrong (empty) data. Their integration tests are env-gated
+    // (docker) and deferred to Task 6 alongside the query templates. The
+    // FakeDriver provides functional in-memory implementations for unit tests.
+
+    async fn node_bfs_search(
+        &self,
+        _origins: &[String],
+        _filters: &SearchFilters,
+        _max_depth: usize,
+        _group_ids: &[String],
+        _limit: usize,
+    ) -> Result<Vec<EntityNode>, DriverError> {
+        // TODO(Task 6): BFS Cypher per plan R9 (var-length depth inlined, not a
+        // $param; SearchFilters WHERE fragments).
+        Err(DriverError::Query(
+            "phase-2 task-6 pending: node_bfs_search".into(),
+        ))
+    }
+
+    async fn edge_bfs_search(
+        &self,
+        _origins: &[String],
+        _max_depth: usize,
+        _filters: &SearchFilters,
+        _group_ids: &[String],
+        _limit: usize,
+    ) -> Result<Vec<EntityEdge>, DriverError> {
+        // TODO(Task 6): path-expansion BFS Cypher per plan R9.
+        Err(DriverError::Query(
+            "phase-2 task-6 pending: edge_bfs_search".into(),
+        ))
+    }
+
+    async fn episode_fulltext_search(
+        &self,
+        _query: &str,
+        _group_ids: &[String],
+        _limit: usize,
+    ) -> Result<Vec<EpisodicNode>, DriverError> {
+        // TODO(Task 6): episode_content fulltext index query per plan R5.
+        Err(DriverError::Query(
+            "phase-2 task-6 pending: episode_fulltext_search".into(),
+        ))
+    }
+
+    async fn get_embeddings_for_nodes(
+        &self,
+        _uuids: &[String],
+    ) -> Result<HashMap<String, Vec<f32>>, DriverError> {
+        // TODO(Task 6): RETURN uuid + name_embedding WHERE uuid IN $uuids
+        // AND name_embedding IS NOT NULL.
+        Err(DriverError::Query(
+            "phase-2 task-6 pending: get_embeddings_for_nodes".into(),
+        ))
+    }
+
+    async fn get_embeddings_for_edges(
+        &self,
+        _uuids: &[String],
+    ) -> Result<HashMap<String, Vec<f32>>, DriverError> {
+        // TODO(Task 6): RETURN uuid + fact_embedding WHERE uuid IN $uuids
+        // AND fact_embedding IS NOT NULL.
+        Err(DriverError::Query(
+            "phase-2 task-6 pending: get_embeddings_for_edges".into(),
+        ))
+    }
+
+    async fn nodes_connected_to_center(
+        &self,
+        _node_uuids: &[String],
+        _center_uuid: &str,
+    ) -> Result<Vec<String>, DriverError> {
+        // TODO(Task 6): undirected 1-hop RELATES_TO adjacency Cypher per plan R7.
+        Err(DriverError::Query(
+            "phase-2 task-6 pending: nodes_connected_to_center".into(),
+        ))
+    }
+
+    async fn episode_mention_counts(
+        &self,
+        _node_uuids: &[String],
+    ) -> Result<HashMap<String, u64>, DriverError> {
+        // TODO(Task 6): MENTIONS in-degree count Cypher per plan R8.
+        Err(DriverError::Query(
+            "phase-2 task-6 pending: episode_mention_counts".into(),
+        ))
     }
 }
 

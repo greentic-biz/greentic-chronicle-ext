@@ -107,6 +107,9 @@ impl Chronicle {
             query,
             group_ids,
             config,
+            // Facade `search()` applies no filters; advanced filtering arrives
+            // with `search_()` in Task 7.
+            &crate::search::filters::SearchFilters::default(),
         )
         .await
     }

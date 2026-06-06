@@ -18,6 +18,7 @@ use crate::errors::ChronicleError;
 use crate::types::EntityEdge;
 
 use super::config::{EdgeReranker, EdgeSearchMethod, SearchConfig};
+use super::filters::SearchFilters;
 use super::rrf::rrf;
 
 /// Hybrid edge search with configurable methods and RRF reranking.
@@ -39,6 +40,7 @@ pub async fn edge_search(
     query: &str,
     group_ids: &[String],
     config: &SearchConfig,
+    filters: &SearchFilters,
 ) -> Result<Vec<EntityEdge>, ChronicleError> {
     let Some(edge_config) = &config.edge_config else {
         return Ok(Vec::new());
@@ -56,9 +58,10 @@ pub async fn edge_search(
         (true, true) => {
             let vector = embedder.create(query).await?;
             let (bm25, cosine) = tokio::join!(
-                driver.edge_fulltext_search(query, group_ids, candidate_limit),
+                driver.edge_fulltext_search(query, filters, group_ids, candidate_limit),
                 driver.edge_similarity_search(
                     &vector,
+                    filters,
                     group_ids,
                     candidate_limit,
                     edge_config.sim_min_score,
@@ -68,7 +71,7 @@ pub async fn edge_search(
         }
         (true, false) => {
             let result = driver
-                .edge_fulltext_search(query, group_ids, candidate_limit)
+                .edge_fulltext_search(query, filters, group_ids, candidate_limit)
                 .await?;
             (Some(result), None)
         }
@@ -77,6 +80,7 @@ pub async fn edge_search(
             let result = driver
                 .edge_similarity_search(
                     &vector,
+                    filters,
                     group_ids,
                     candidate_limit,
                     edge_config.sim_min_score,

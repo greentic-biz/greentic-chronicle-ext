@@ -280,6 +280,10 @@ pub async fn resolve_extracted_edges(
             &edge.fact,
             std::slice::from_ref(&edge.group_id),
             &edge_hybrid_search_rrf(),
+            // D-3 edge-candidate re-ranking closes in Task 7; for now the
+            // invalidation search passes empty filters (upstream-faithful for
+            // the invalidation candidates, which use no SearchFilters).
+            &crate::search::filters::SearchFilters::default(),
         )
         .await?;
         let existing: Vec<EntityEdge> = invalidation_hits

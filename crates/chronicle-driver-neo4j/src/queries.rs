@@ -769,19 +769,33 @@ pub fn node_filter_fragments(filters: &SearchFilters) -> Result<FilterFragments,
 /// Range indices: uuid + group_id range indices for Entity/Episodic/RELATES_TO/
 /// MENTIONS, `name_entity_index`, created/valid/expired/invalid_at edge indices,
 /// valid_at/created_at episodic. Verbatim names + targets from
-/// `get_range_indices` (Neo4j branch), filtered to the Phase-1 label set
-/// (Community / Saga / HAS_MEMBER / HAS_EPISODE / NEXT_EPISODE excluded — those
-/// node/edge kinds are Phase-4+ and have no save path yet).
+/// `get_range_indices` (Neo4j branch).
+///
+/// Phase-4 additions (Community / Saga / HAS_MEMBER / HAS_EPISODE / NEXT_EPISODE):
+/// community_uuid, community_group_id, has_member_uuid,
+/// saga_uuid, saga_group_id, saga_name,
+/// has_episode_uuid, has_episode_group_id, next_episode_uuid, next_episode_group_id.
+/// All ported verbatim from upstream `get_range_indices` (Neo4j branch) @ 34f56e65.
 pub const RANGE_INDICES: &[&str] = &[
     "CREATE INDEX entity_uuid IF NOT EXISTS FOR (n:Entity) ON (n.uuid)",
     "CREATE INDEX episode_uuid IF NOT EXISTS FOR (n:Episodic) ON (n.uuid)",
+    "CREATE INDEX community_uuid IF NOT EXISTS FOR (n:Community) ON (n.uuid)",
+    "CREATE INDEX saga_uuid IF NOT EXISTS FOR (n:Saga) ON (n.uuid)",
     "CREATE INDEX relation_uuid IF NOT EXISTS FOR ()-[e:RELATES_TO]-() ON (e.uuid)",
     "CREATE INDEX mention_uuid IF NOT EXISTS FOR ()-[e:MENTIONS]-() ON (e.uuid)",
+    "CREATE INDEX has_member_uuid IF NOT EXISTS FOR ()-[e:HAS_MEMBER]-() ON (e.uuid)",
+    "CREATE INDEX has_episode_uuid IF NOT EXISTS FOR ()-[e:HAS_EPISODE]-() ON (e.uuid)",
+    "CREATE INDEX next_episode_uuid IF NOT EXISTS FOR ()-[e:NEXT_EPISODE]-() ON (e.uuid)",
     "CREATE INDEX entity_group_id IF NOT EXISTS FOR (n:Entity) ON (n.group_id)",
     "CREATE INDEX episode_group_id IF NOT EXISTS FOR (n:Episodic) ON (n.group_id)",
+    "CREATE INDEX community_group_id IF NOT EXISTS FOR (n:Community) ON (n.group_id)",
+    "CREATE INDEX saga_group_id IF NOT EXISTS FOR (n:Saga) ON (n.group_id)",
     "CREATE INDEX relation_group_id IF NOT EXISTS FOR ()-[e:RELATES_TO]-() ON (e.group_id)",
     "CREATE INDEX mention_group_id IF NOT EXISTS FOR ()-[e:MENTIONS]-() ON (e.group_id)",
+    "CREATE INDEX has_episode_group_id IF NOT EXISTS FOR ()-[e:HAS_EPISODE]-() ON (e.group_id)",
+    "CREATE INDEX next_episode_group_id IF NOT EXISTS FOR ()-[e:NEXT_EPISODE]-() ON (e.group_id)",
     "CREATE INDEX name_entity_index IF NOT EXISTS FOR (n:Entity) ON (n.name)",
+    "CREATE INDEX saga_name IF NOT EXISTS FOR (n:Saga) ON (n.name)",
     "CREATE INDEX created_at_entity_index IF NOT EXISTS FOR (n:Entity) ON (n.created_at)",
     "CREATE INDEX created_at_episodic_index IF NOT EXISTS FOR (n:Episodic) ON (n.created_at)",
     "CREATE INDEX valid_at_episodic_index IF NOT EXISTS FOR (n:Episodic) ON (n.valid_at)",
@@ -794,7 +808,8 @@ pub const RANGE_INDICES: &[&str] = &[
 
 /// Fulltext indices (verbatim from `get_fulltext_indices`, Neo4j branch).
 /// Phase-2 adds `episode_content` (drives [`EPISODE_FULLTEXT_SEARCH_HEAD`]).
-/// `community_name` remains excluded (community scope is Phase-4).
+/// Phase-4 adds `community_name` (drives community fulltext search, R8).
+/// Ported verbatim from upstream `get_fulltext_indices` (Neo4j branch) @ 34f56e65.
 pub const FULLTEXT_INDICES: &[&str] = &[
     "CREATE FULLTEXT INDEX node_name_and_summary IF NOT EXISTS \
      FOR (n:Entity) ON EACH [n.name, n.summary, n.group_id]",
@@ -802,24 +817,40 @@ pub const FULLTEXT_INDICES: &[&str] = &[
      FOR ()-[e:RELATES_TO]-() ON EACH [e.name, e.fact, e.group_id]",
     "CREATE FULLTEXT INDEX episode_content IF NOT EXISTS \
      FOR (e:Episodic) ON EACH [e.content, e.source, e.source_description, e.group_id]",
+    "CREATE FULLTEXT INDEX community_name IF NOT EXISTS \
+     FOR (n:Community) ON EACH [n.name, n.group_id]",
 ];
 
 /// DROP statements used when `delete_existing = true`. Upstream calls
 /// `CALL db.indexes() YIELD name DROP INDEX name` (drop ALL). That procedure is
 /// removed in Neo4j 5, so we issue targeted `DROP INDEX <name> IF EXISTS` for the
 /// indices we manage instead.
+///
+/// Phase-4 additions: community_uuid, community_group_id, has_member_uuid,
+/// saga_uuid, saga_group_id, saga_name, has_episode_uuid, has_episode_group_id,
+/// next_episode_uuid, next_episode_group_id, community_name.
 pub fn drop_index_statements() -> Vec<String> {
     let mut out = Vec::new();
     for name in [
         "entity_uuid",
         "episode_uuid",
+        "community_uuid",
+        "saga_uuid",
         "relation_uuid",
         "mention_uuid",
+        "has_member_uuid",
+        "has_episode_uuid",
+        "next_episode_uuid",
         "entity_group_id",
         "episode_group_id",
+        "community_group_id",
+        "saga_group_id",
         "relation_group_id",
         "mention_group_id",
+        "has_episode_group_id",
+        "next_episode_group_id",
         "name_entity_index",
+        "saga_name",
         "created_at_entity_index",
         "created_at_episodic_index",
         "valid_at_episodic_index",
@@ -831,6 +862,7 @@ pub fn drop_index_statements() -> Vec<String> {
         "node_name_and_summary",
         "edge_name_and_fact",
         "episode_content",
+        "community_name",
     ] {
         out.push(format!("DROP INDEX {name} IF EXISTS"));
     }

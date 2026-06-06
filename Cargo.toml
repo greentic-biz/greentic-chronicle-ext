@@ -23,6 +23,7 @@ chronicle-testkit = { path = "crates/chronicle-testkit" }
 chronicle-driver-neo4j = { path = "crates/chronicle-driver-neo4j" }
 chronicle-driver-surreal = { path = "crates/chronicle-driver-surreal" }
 chronicle-driver-falkor = { path = "crates/chronicle-driver-falkor" }
+chronicle-llm-openai = { path = "crates/chronicle-llm-openai" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
@@ -42,6 +43,7 @@ surrealdb = { version = "3", default-features = false, features = [
     "kv-mem",
 ] }
 tempfile = "3"
+tiktoken-rs = "0.12"
 async-openai = { version = "0.40", default-features = false, features = [
     "rustls",
     "chat-completion",

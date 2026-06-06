@@ -6,21 +6,21 @@
 //! `graphiti_core/driver/neo4j/operations/`) @ 34f56e65 (v0.29.1), adapted to the
 //! typed operation-level driver traits in `chronicle-core::driver`.
 //!
-//! ## Cross-call atomicity gap (CARRIED-FORWARD NOTE)
+//! ## Cross-call atomicity (CLOSED in Phase 4)
 //!
-//! Upstream `add_episode` persists episode + entity nodes + entity edges +
-//! episodic edges inside a single Neo4j transaction. The chronicle driver trait
-//! splits persistence into four independent save operations
+//! Upstream `add_episode` / `add_nodes_and_edges_bulk` persist episode + entity
+//! nodes + entity edges + episodic edges inside a single Neo4j transaction. The
+//! chronicle driver trait still exposes four independent save operations
 //! (`save_episode`, `save_entity_nodes`, `save_entity_edges`,
-//! `save_episodic_edges`), each invoked sequentially by the pipeline. Here, each
-//! save op runs as its OWN single transaction (`Graph::start_txn` →
-//! `UNWIND ... RETURN` → `commit`), so it is atomic *within* the op, but the four
-//! ops are NOT atomic *as a group*. A crash between calls can leave a partially
-//! persisted episode.
+//! `save_episodic_edges`) — each its OWN transaction, atomic only *within* the
+//! op — for granular callers.
 //!
-//! Phase-2 improvement: add a transactional `save_all` operation to the driver
-//! trait that wraps all four writes in one transaction. Until then, callers must
-//! treat `add_episode` as best-effort-with-retry, not all-or-nothing.
+//! Phase 4 adds [`BulkSaveOps::save_all`], which the `add_episode` and bulk
+//! persist tails now call: it wraps all four writes in ONE `start_txn → run all →
+//! commit` transaction (rollback on any error), so a mid-batch failure leaves the
+//! graph unchanged. This closes the carried-forward group-atomicity gap for the
+//! Neo4j backend; the in-memory `FakeDriver` inherits the default sequential
+//! `save_all` (nothing can partially fail in memory).
 
 mod convert;
 mod queries;
@@ -35,8 +35,9 @@ use tracing::debug;
 use std::collections::HashMap;
 
 use chronicle_core::driver::{
-    CommunityOps, DriverError, EntityEdgeOps, EntityNodeOps, EpisodeOps, EpisodicEdgeOps,
-    GraphDriver, GroupClusterProjection, Neighbor, NodeNeighbors, SagaOps, SchemaOps, SearchOps,
+    BulkSaveOps, CommunityOps, DriverError, EntityEdgeOps, EntityNodeOps, EpisodeOps,
+    EpisodicEdgeOps, GraphDriver, GroupClusterProjection, Neighbor, NodeNeighbors, SagaOps,
+    SchemaOps, SearchOps,
 };
 use chronicle_core::search::filters::SearchFilters;
 use chronicle_core::types::{
@@ -95,6 +96,45 @@ impl Neo4jDriver {
             .map_err(|e| DriverError::Query(format!("{ctx}: drain: {e}")))?
             .is_some()
         {}
+        txn.commit()
+            .await
+            .map_err(|e| DriverError::Query(format!("{ctx}: commit: {e}")))
+    }
+
+    /// Run several write queries inside ONE transaction, committing only after
+    /// every statement has been applied. If any statement fails the transaction
+    /// is rolled back (best-effort) and the error is returned, leaving the graph
+    /// unchanged — this is the atomic group-save primitive behind `save_all`.
+    async fn run_all_in_txn(&self, queries: Vec<Query>, ctx: &str) -> Result<(), DriverError> {
+        if queries.is_empty() {
+            return Ok(());
+        }
+        let mut txn = self
+            .graph
+            .start_txn_on(self.database.as_str())
+            .await
+            .map_err(|e| DriverError::Query(format!("{ctx}: begin txn: {e}")))?;
+        for q in queries {
+            let run = async {
+                let mut stream = txn
+                    .execute(q)
+                    .await
+                    .map_err(|e| DriverError::Query(format!("{ctx}: execute: {e}")))?;
+                while stream
+                    .next(txn.handle())
+                    .await
+                    .map_err(|e| DriverError::Query(format!("{ctx}: drain: {e}")))?
+                    .is_some()
+                {}
+                Ok::<(), DriverError>(())
+            }
+            .await;
+            if let Err(e) = run {
+                // Roll back so a mid-batch failure leaves no partial state.
+                let _ = txn.rollback().await;
+                return Err(e);
+            }
+        }
         txn.commit()
             .await
             .map_err(|e| DriverError::Query(format!("{ctx}: commit: {e}")))
@@ -418,6 +458,63 @@ impl EpisodicEdgeOps for Neo4jDriver {
         let payload: Vec<_> = edges.iter().map(convert::episodic_edge_to_bolt).collect();
         let q = query(queries::SAVE_EPISODIC_EDGES).param("episodic_edges", payload);
         self.run_in_txn(q, "save_episodic_edges").await
+    }
+}
+
+#[async_trait]
+impl BulkSaveOps for Neo4jDriver {
+    /// Atomic group-save: episodes, entity nodes, entity edges and episodic edges
+    /// in a SINGLE Neo4j transaction (closes the carried-forward atomicity gap).
+    ///
+    /// Each non-empty collection contributes one `UNWIND ... MERGE` statement,
+    /// built identically to the standalone save ops, but they share one
+    /// `start_txn → run all → commit` so a mid-batch failure rolls the whole
+    /// batch back. Empty collections are skipped; an entirely-empty batch is a
+    /// no-op.
+    async fn save_all(
+        &self,
+        episodes: &[EpisodicNode],
+        episodic_edges: &[EpisodicEdge],
+        entity_nodes: &[EntityNode],
+        entity_edges: &[EntityEdge],
+    ) -> Result<(), DriverError> {
+        debug!(
+            episodes = episodes.len(),
+            episodic_edges = episodic_edges.len(),
+            entity_nodes = entity_nodes.len(),
+            entity_edges = entity_edges.len(),
+            "neo4j save_all (transactional)"
+        );
+
+        let mut statements: Vec<Query> = Vec::new();
+
+        if !episodes.is_empty() {
+            let payload: Vec<_> = episodes.iter().map(convert::episode_to_bolt).collect();
+            statements.push(query(queries::SAVE_EPISODES).param("episodes", payload));
+        }
+        if !entity_nodes.is_empty() {
+            let mut payload = Vec::with_capacity(entity_nodes.len());
+            for n in entity_nodes {
+                payload.push(convert::entity_node_to_bolt(n)?);
+            }
+            statements.push(query(queries::SAVE_ENTITY_NODES).param("nodes", payload));
+        }
+        if !entity_edges.is_empty() {
+            let mut payload = Vec::with_capacity(entity_edges.len());
+            for e in entity_edges {
+                payload.push(convert::entity_edge_to_bolt(e)?);
+            }
+            statements.push(query(queries::SAVE_ENTITY_EDGES).param("edges", payload));
+        }
+        if !episodic_edges.is_empty() {
+            let payload: Vec<_> = episodic_edges
+                .iter()
+                .map(convert::episodic_edge_to_bolt)
+                .collect();
+            statements.push(query(queries::SAVE_EPISODIC_EDGES).param("episodic_edges", payload));
+        }
+
+        self.run_all_in_txn(statements, "save_all").await
     }
 }
 

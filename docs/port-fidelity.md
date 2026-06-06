@@ -49,16 +49,25 @@ Statuses:
 | `crates/chronicle-core/src/search/rerank.rs` | `graphiti_core/search/search_utils.py` | verbatim | `maximal_marginal_relevance`, `node_distance_rerank`, `episode_mentions_rerank` (D-15 quirk). |
 | `crates/chronicle-core/src/search/search.rs` | `graphiti_core/search/search.py::search` | adapted | Top-level multi-scope entrypoint; empty-query guard, single embed decision (now includes community cosine/mmr), 4 parallel scopes via `tokio::join!` (edge/node/episode/community). `SearchResults` carries community fields (D-16 resolved). |
 | `crates/chronicle-core/src/search/community_search.rs` | `graphiti_core/search/search.py::community_search` | adapted | Community scope. UPSTREAM QUIRK: ALWAYS runs both fulltext + similarity regardless of `search_methods` list (replicated bug-for-bug). Rerankers rrf/mmr/cross_encoder (cross_encoder ranks `community.name`, no pre-truncate; missing encoder → `InvalidInput`). 2*limit candidates, parallel, slice `[:limit]`. |
+| `crates/chronicle-core/src/types/community.rs` | `graphiti_core/nodes.py::CommunityNode` + `edges.py::CommunityEdge` | adapted | `CommunityNode` (uuid/name/group_id/labels `["Community"]`/created_at/name_embedding/summary default `""`) + `CommunityEdge` HAS_MEMBER (Community→Entity|Community). created_at-only (no bi-temporal). Field order + defaults verbatim (R1). |
+| `crates/chronicle-core/src/types/saga.rs` | `graphiti_core/nodes.py::SagaNode` + saga edges | adapted | `SagaNode` (summary default `""`, first/last_episode_uuid, last_summarized_at, last_summarized_episode_valid_at) + `HasEpisodeEdge` (Saga→Episodic) + `NextEpisodeEdge` (Episodic→Episodic), each `{uuid,group_id,created_at}` (R9). |
+| `crates/chronicle-core/src/pipeline/community_ops.rs` | `graphiti_core/utils/maintenance/community_operations.py` | deviation | `label_propagation` (R2, exact tuple-sort tie-break + `max(candidate,curr)` fallback) **plus a 1000-iteration safety cap (D-22, the one Phase-4 algorithm deviation)**; `get_community_clusters`, `build_community` pairwise-reduce (R3, `truncate_at_sentence` + `MAX_SUMMARY_CHARS=1000`), `build_community_edges`, `build_communities` (concurrency 10), `remove_communities`, `determine_entity_community` + `update_community` (R4, neighbor-vote only). `update_communities` is sequential per node (D-23). |
+| `crates/chronicle-core/src/prompts/summarize_nodes.rs` (community) | `graphiti_core/prompts/summarize_nodes.py` | verbatim | `summarize_pair` + `summary_description` prompt fns + context structs VERBATIM (R3): summarize_pair system "You are a helpful assistant that combines summaries into a single dense factual summary" → `Summary{summary}`; summary_description system "...describes provided contents in a single sentence" → `SummaryDescription{description}`. |
+| `crates/chronicle-core/src/pipeline/saga.rs` | `graphiti_core/graphiti.py` saga helpers + `summarize_sagas.py` | adapted | Saga threading (get-or-create by (name,group_id), prev-episode resolution, NEXT_EPISODE/HAS_EPISODE wiring, first/last pointer update — R9); `summarize_saga` two-watermark logic (`last_summarized_at` wall-clock filter + `last_summarized_episode_valid_at` episode-time). UTF-8 boundary truncation on summary input (D-24). |
+| `crates/chronicle-core/src/prompts/summarize_sagas.rs` | `graphiti_core/prompts/summarize_sagas.py` | verbatim | `summarize_saga` prompt VERBATIM (R9): system "You extract durable knowledge from message threads..."; context `{saga_name, existing_summary, episodes}`; response `SagaSummary{summary}`. |
+| `crates/chronicle-core/src/pipeline/bulk.rs` | `graphiti_core/utils/bulk_utils.py` + `graphiti.py::add_episode_bulk` | adapted | `RawEpisode`, `AddBulkEpisodeResults`, `_build_directed_uuid_map` (directed union-find, iterative path compression) + `compress_uuid_map` (undirected union-find, smallest-uuid-wins), `resolve_edge_pointers`, `dedupe_nodes_bulk`/`dedupe_edges_bulk`, `extract_nodes_and_edges_bulk`, `retrieve_previous_episodes_bulk`, `add_nodes_and_edges_bulk` (now transactional via `save_all` — D-5 CLOSED). `CHUNK_SIZE=10` const (caller-chunked). Communities never updated in bulk (upstream — `communities=[]`). |
+| `crates/chronicle-core/src/pipeline/maintenance.rs` | `graphiti_core/graphiti.py` (`add_triplet`, `remove_episode`, `get_nodes_and_edges_by_episode`) | adapted | `add_triplet` (R7, synthetic-episode full dedup/invalidation, save via bulk `save_all`, no episodic/community), `remove_episode` (R5 cascade: primary-source edges + single-mention nodes only, DETACH episode), `get_nodes_and_edges_by_episode` (R10, trivial fan-out). |
+| `crates/chronicle-core/src/driver/mod.rs` (Phase-4 ops) | `community_operations.py`, saga helpers, `bulk_utils.py` | adapted | New driver traits: `CommunityOps` (save/get community nodes+edges, fulltext+similarity+embeddings search, clusters projection, member/neighbor-vote lookups, remove_communities — R1/R2/R3/R4/R8), `SagaOps` (save saga node + HAS_EPISODE/NEXT_EPISODE, get-or-create, prev-episode, episode-contents — R9), `BulkSaveOps::save_all` (transactional group-save — D-5 CLOSED). |
 | `crates/chronicle-core/src/cross_encoder/mod.rs` | `graphiti_core/cross_encoder/client.py` | adapted | `CrossEncoderClient` trait (`rank(query, passages) -> desc-sorted (passage, score)`). |
 | `crates/chronicle-llm-openai/src/reranker.rs` | `graphiti_core/cross_encoder/openai_reranker_client.py` | adapted | OpenAI boolean-logprob reranker (gpt-4.1-nano, temperature 0, logit_bias True/False token ids, top_logprobs 2; score = exp(lp) if "true" else 1-exp(lp), desc sort). Uses deprecated `max_tokens` request field (D-20). |
 | `crates/chronicle-core/src/search/edge_search.rs` (BFS) / `crates/chronicle-driver-neo4j/src/queries.rs` (BFS Cypher) | `graphiti_core/search/search_utils.py::*_bfs` | adapted | Edge-BFS undirected re-join (`(n)-[e]-(m)`) carries upstream duplicate-row behaviour bug-for-bug (D-19). Var-length depth inlined as sanitized integer (not a `$param`). |
-| `crates/chronicle-core/src/chronicle.rs` | `graphiti_core/graphiti.py::Graphiti` | adapted | `Chronicle` facade: `add_episode`, `retrieve_episodes`, `search` (config-direct), `search_with_center` (R13 recipe-routing), `search_` (R13 advanced multi-scope, default COMBINED_HYBRID_SEARCH_CROSS_ENCODER), `with_cross_encoder` builder, `build_indices_and_constraints`. `build_communities`, batch operations deferred (Phase 4). |
-| `crates/chronicle-driver-neo4j/src/lib.rs` | `graphiti_core/driver/neo4j_driver.py` + operations files | adapted | Full `GraphDriver` impl over `neo4rs`. Cross-call atomicity gap documented (deviation #5). |
+| `crates/chronicle-core/src/chronicle.rs` | `graphiti_core/graphiti.py::Graphiti` | adapted | `Chronicle` facade: `add_episode` (+ optional saga / `update_communities` params, additive — see dw-providers note below), `retrieve_episodes`, `search` (config-direct), `search_with_center` (R13), `search_` (R13 advanced multi-scope), `with_cross_encoder`, `build_indices_and_constraints`. Phase 4 ADDS `add_episode_bulk`, `add_triplet`, `remove_episode`, `build_communities`, `get_nodes_and_edges_by_episode`, `summarize_saga` — full Graphiti-core parity. |
+| `crates/chronicle-driver-neo4j/src/lib.rs` | `graphiti_core/driver/neo4j_driver.py` + operations files | adapted | Full `GraphDriver` impl over `neo4rs` incl. Phase-4 `CommunityOps`/`SagaOps`/`BulkSaveOps`. `save_all` runs episodes+nodes+entity-edges+episodic-edges in ONE `start_txn → run all → commit` (rollback on error) — **cross-call atomicity gap (D-5) CLOSED**. |
 | `crates/chronicle-driver-neo4j/src/queries.rs` | `graphiti_core/driver/neo4j/` query builders + `graph_data_operations.py::retrieve_episodes` + `search_utils.py::fulltext_query` | adapted | Cypher query builders. Lucene OR-precedence quirk reproduced bug-for-bug (deviation #6). `validate_group_id` pattern `^[a-zA-Z0-9_-]+$` verbatim from upstream. `MAX_QUERY_LENGTH=128` verbatim. Retrieve episodes tie order is backend-dependent (deviation #12). |
 | `crates/chronicle-driver-neo4j/src/convert.rs` | (Neo4j ↔ domain type conversions, no direct upstream equivalent) | adapted | Bolt value ↔ Rust type bridge; no upstream analog. |
 | `crates/chronicle-llm-openai/src/llm.rs` | `graphiti_core/llm_client/openai_generic_client.py`, `openai_base_client.py` | deviation | `DEFAULT_MODEL="gpt-4.1-mini"`, `DEFAULT_SMALL_MODEL="gpt-4.1-nano"`, temperature=0, max_tokens=16384 verbatim. `EmptyResponse` non-retryable (deviation #9). No error-context message appended on retry (deviation #9). RateLimit retried per base tenacity policy (deviation #9). |
 | `crates/chronicle-llm-openai/src/embedder.rs` | `graphiti_core/embedder/openai.py` | adapted | `OpenAiEmbedder`; `DEFAULT_EMBEDDING_MODEL="text-embedding-3-small"`. `EMBEDDING_DIM` is compile-time const (deviation #11). |
-| `crates/chronicle-testkit/src/fake_driver.rs` | (test fixture, no upstream equivalent) | adapted | In-memory `FakeDriver`; deterministic uuid tie-breaks in similarity sorts (deviation #13, test-only). |
+| `crates/chronicle-testkit/src/fake_driver.rs` | (test fixture, no upstream equivalent) | adapted | In-memory `FakeDriver`; deterministic uuid tie-breaks in similarity sorts (deviation #13, test-only). Phase-4 `CommunityOps`/`SagaOps` in-memory; `BulkSaveOps` uses the default sequential `save_all` (no transaction needed — nothing can partially fail in memory). |
 | `crates/chronicle-testkit/src/mock_llm.rs` | (test fixture, no upstream equivalent) | adapted | `MockLlm` replay queue. |
 | `crates/chronicle-testkit/src/mock_embedder.rs` | (test fixture, no upstream equivalent) | adapted | `MockEmbedder` keyed on string hash. |
 
@@ -88,9 +97,9 @@ Status: **CLOSED**. Upstream `resolve_extracted_edges` (edge_operations.py:392-4
 
 Upstream fans out node/edge candidate queries concurrently under a semaphore. Phase-1 runs them sequentially. No behavioral difference on results; throughput is lower for large graphs. Phase-2: replace loops with `futures::future::join_all` under the shared semaphore.
 
-### D-5: Persist = 4 sequential driver calls vs upstream single transaction (atomicity gap)
+### D-5: Persist atomicity — **CLOSED (Phase 4)**
 
-Upstream `add_episode` wraps `save_episode`, `save_entity_nodes`, `save_entity_edges`, and `save_episodic_edges` in a single Neo4j transaction. Chronicle executes these as four independent transactions. A crash between calls can leave a partially persisted episode. Phase-2 improvement: add a `save_all` transactional operation to `GraphDriver`.
+CLOSED. Phase 4 adds `BulkSaveOps::save_all(episodes, episodic_edges, entity_nodes, entity_edges)`, and both persist tails — `add_episode` (single-episode) and `add_nodes_and_edges_bulk` (batch/triplet) — now call it instead of four independent saves. The Neo4j backend implements `save_all` as ONE transaction (`start_txn → run each non-empty UNWIND statement → commit`, with rollback on any statement error), matching upstream `add_episode`/`add_nodes_and_edges_bulk`'s single-transaction persist: a mid-batch failure leaves the graph unchanged (verified by `save_all_rolls_back_on_mid_batch_failure_live`). The in-memory `FakeDriver` inherits the trait's default sequential `save_all` (nothing can partially fail in memory). The granular four save ops remain on the trait for callers that need per-collection control.
 
 ### D-6: Lucene OR-precedence quirk in multi-group scoping reproduced bug-for-bug
 
@@ -165,6 +174,39 @@ This is the one place the port deliberately *diverges to be correct* rather than
 
 In the edge-scope `node_distance` reranker, upstream groups edge uuids by `source_node_uuid`, reranks the *source nodes* via `node_distance_reranker`, then expands back to edge uuids in returned-node order — but the returned score list is the per-*node* distance scores, not per-edge, so the edge-score alignment after expansion does not 1:1 track the expanded edge uuids. The port reproduces this expansion + score-list behaviour exactly (bug-for-bug) rather than re-deriving per-edge scores. The final `[:limit]` slice and downstream consumers tolerate the mismatch identically to upstream.
 
+### D-22: `label_propagation` iteration cap — **safety deviation (the one Phase-4 algorithm divergence)**
+
+Upstream `label_propagation` (`community_operations.py`) loops `while True` with NO iteration bound. Synchronous label propagation can oscillate forever on pathological non-cluster inputs (e.g. a bare 2-node path `a—b` with equal edge weights, where each pass swaps the two labels), which would hang `build_communities`. This port adds `MAX_LABEL_PROPAGATION_ITERATIONS = 1000`: on overflow it emits a `tracing::warn!` and returns the last assignment instead of spinning. This is a pure safety fix and **cannot change behaviour on correct input** — real `get_community_clusters` projections converge in a handful of passes (verified: all four convergence/tie-break unit tests and the live `community_clusters_and_neighbor_vote_live` test stay well under the cap; `label_propagation_caps_on_oscillating_input` confirms termination on the degenerate case). The cap is the only deliberate algorithm-level divergence introduced in Phase 4.
+
+### D-23: `update_communities` runs sequentially per node (vs upstream parallel)
+
+On ingest with `update_communities=True`, upstream fans out `update_community` per affected node under a semaphore. This port iterates affected nodes sequentially (each `determine_entity_community` → `update_community` → save). Output is identical (neighbor-vote membership is independent per node); only the wall-clock fan-out differs. Performance-only deviation, consistent with D-4.
+
+### D-24: `summarize_saga` truncates summary input on a UTF-8 char boundary
+
+`summarize_saga` (`pipeline/saga.rs`) caps the rolling saga summary / concatenated-episode context at the upstream char budget. Python slices on code-point indices; Rust strings are byte-indexed, so the port truncates at the nearest **char boundary at or below** the byte budget (never mid-multibyte-sequence) to avoid panicking on non-ASCII content. For ASCII content the cut point is identical to upstream; for multibyte content the Rust cut may fall a few bytes earlier (never later). Behaviour-equivalent for the summarization prompt.
+
+### D-25: Community / saga save uses UNWIND-batch Cypher vs upstream per-node single-MERGE
+
+Upstream's `get_community_node_save_query` / saga save queries emit a single-node `MERGE` per call (the Python caller loops). The Neo4j port batches them as one `UNWIND $rows AS row MERGE (...)` statement per collection (identical shape to the existing entity-node/edge save queries), so a list of communities/sagas/edges persists in one round-trip. The resulting graph state is identical (MERGE-by-uuid is idempotent and order-independent); only the statement count per save call differs. Consistent with how Phase-1 already batches entity saves.
+
+---
+
+## Consumer migration: `AddEpisodeRequest` → dw-providers v0.3.0
+
+Phase 4 adds **three new fields** to `AddEpisodeRequest` (all additive, all defaulting to "off"):
+
+- `update_communities: bool` (default `false`) — run neighbour-vote community membership update after ingest.
+- `saga: Option<String>` (default `None`) — associate the episode with a named saga thread (HAS_EPISODE / NEXT_EPISODE wiring).
+- `saga_previous_episode_uuid: Option<String>` (default `None`) — explicit previous-episode override for the NEXT_EPISODE chain (falls back to the saga's latest-by-valid_at episode when `None`).
+
+`AddEpisodeRequest` derives `Default`, so the breaking change is source-level only. The `greentic-dw-providers` crate currently pins chronicle **v0.2.0** and constructs the struct by named fields, so it is **unaffected until it bumps to v0.3.0**. When it does:
+
+- Switch field-by-field construction to spread the defaults: `AddEpisodeRequest { name, episode_body, source, source_description, reference_time, group_id, ..Default::default() }`. This keeps the call site compiling across any future additive field.
+- Default behaviour is byte-identical to v0.2.0 (no community updates, no saga threading) — opt into the new behaviour only where the provider wants it.
+
+No other public-API breaks in v0.3.0; the new facade methods (`add_episode_bulk`, `add_triplet`, `remove_episode`, `build_communities`, `get_nodes_and_edges_by_episode`, `summarize_saga`) are pure additions.
+
 ---
 
 ## DEFERRED
@@ -174,7 +216,7 @@ Features acknowledged but out of Phase-1 scope. Listed with target phase.
 | Feature | Target | Notes |
 |---|---|---|
 | Reflexion (self-critique loop) | absent in upstream v0.29.1 | Not present in pinned upstream; not applicable |
-| Communities / saga / bulk ingest | Phase 4 | `build_communities`, `build_community_for_node`, community edge/node types, `community_config`, COMMUNITY_* recipes, `SearchResults` community fields (D-16) |
+| Communities / saga / bulk ingest | ✅ Done (Phase 4) | `build_communities`, `determine_entity_community`/`update_community`, community + saga node/edge types, `add_episode_bulk`, `add_triplet`, `remove_episode`, `summarize_saga`, `community_config`, COMMUNITY_* recipes, `SearchResults` community fields (D-16/D-22/D-23/D-24/D-25) |
 | BFS traversal in edge/node search | ✅ Done (Phase 2) | `EdgeSearchMethod::BreadthFirstSearch` + node BFS implemented (self-seed + Cypher); see D-19 |
 | MMR / NodeDistance / EpisodeMentions rerankers | ✅ Done (Phase 2) | Ported in `search/rerank.rs` (D-15, D-21) + dispatched in edge/node scopes |
 | CrossEncoder reranker | ✅ Done (Phase 2) | `CrossEncoderClient` trait + OpenAI logprob impl (D-20) + scope wiring |
@@ -183,10 +225,10 @@ Features acknowledged but out of Phase-1 scope. Listed with target phase.
 | `NodeSearchConfig`, `EpisodeSearchConfig` | ✅ Done (Phase 2) | Full config + reranker enums |
 | Top-level `search_()` / multi-scope facade | ✅ Done (Phase 2) | `Chronicle::search_`, `search_with_center`, `with_cross_encoder` (R13) |
 | `CommunitySearchConfig` + community search scope | ✅ Done (Phase 4) | `CommunitySearchConfig`/`CommunitySearchMethod`/`CommunityReranker`, `community_search`, COMMUNITY_* + COMBINED_* community recipes, `SearchResults` community fields — D-16 RESOLVED |
-| Multi-episode extraction path | Phase 3 | `_process_episode_data` bulk path; `_collapse_exact_duplicate_extracted_nodes`; `node_episode_index_map` |
+| Multi-episode extraction path | ✅ Done (Phase 4) | `add_episode_bulk` cross-episode dedup (`dedupe_nodes_bulk`/`dedupe_edges_bulk`, directed + undirected union-find) in `pipeline/bulk.rs` |
 | Entity/edge-type registries + attribute extraction | Phase 3 | `entity_types` and `edge_types` Pydantic registry; `extract_attributes_from_nodes` batch path |
 | `extract_summaries_batch` / `SummarizedEntities` | Phase 3 | Replace per-node hydration (D-8) |
-| `save_all` transactional driver op | Phase 3 | Atomicity gap (D-5) |
+| `save_all` transactional driver op | ✅ Done (Phase 4) | Atomicity gap CLOSED — `BulkSaveOps::save_all`, Neo4j single-tx + rollback (D-5) |
 | `semaphore_gather` equivalent fan-out | Phase 3 | Performance improvement for D-4 |
 | `fact_triple` EpisodeType variant | Near-term patch | Read-compat gap (D-7) |
 | Kuzu embedded driver | Phase 3 | `chronicle-driver-kuzu` crate not yet created |

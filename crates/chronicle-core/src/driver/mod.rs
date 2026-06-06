@@ -117,6 +117,43 @@ pub trait EpisodicEdgeOps: Send + Sync {
     async fn save_episodic_edges(&self, edges: &[EpisodicEdge]) -> Result<(), DriverError>;
 }
 
+/// Transactional bulk-persist of one ingestion batch (plan R6 / Phase-1
+/// atomicity note).
+///
+/// Upstream `add_nodes_and_edges_bulk` (and `add_episode`'s persist tail) wrap
+/// the four writes — episodes, entity nodes, entity edges, episodic edges — in a
+/// SINGLE Neo4j write transaction so a mid-batch failure rolls back cleanly.
+///
+/// The default implementation here is the historical four-call sequential save
+/// (no cross-call atomicity); it exists so backends without real transactions
+/// (e.g. the in-memory `FakeDriver`, where nothing can partially fail) inherit a
+/// correct-enough behaviour for free. The Neo4j backend OVERRIDES this with a
+/// real `start_txn → run all → commit` (rollback on error), closing the
+/// atomicity gap for the only backend where it matters.
+#[async_trait]
+pub trait BulkSaveOps:
+    EpisodeOps + EntityNodeOps + EntityEdgeOps + EpisodicEdgeOps + Send + Sync
+{
+    /// Persist a full ingestion batch. Backends with transaction support MUST do
+    /// this atomically (all-or-nothing); the default falls back to the four
+    /// independent save ops in order.
+    async fn save_all(
+        &self,
+        episodes: &[EpisodicNode],
+        episodic_edges: &[EpisodicEdge],
+        entity_nodes: &[EntityNode],
+        entity_edges: &[EntityEdge],
+    ) -> Result<(), DriverError> {
+        for episode in episodes {
+            self.save_episode(episode).await?;
+        }
+        self.save_entity_nodes(entity_nodes).await?;
+        self.save_entity_edges(entity_edges).await?;
+        self.save_episodic_edges(episodic_edges).await?;
+        Ok(())
+    }
+}
+
 /// Vector / fulltext / BFS / rerank-support search primitives the backend must
 /// provide.
 ///
@@ -441,6 +478,7 @@ pub trait GraphDriver:
     + EntityEdgeOps
     + EpisodeOps
     + EpisodicEdgeOps
+    + BulkSaveOps
     + SearchOps
     + CommunityOps
     + SagaOps
@@ -785,6 +823,9 @@ mod tests {
             Ok(vec![])
         }
     }
+
+    // Inherits the default sequential `save_all`.
+    impl BulkSaveOps for NullDriver {}
 
     #[async_trait]
     impl SchemaOps for NullDriver {

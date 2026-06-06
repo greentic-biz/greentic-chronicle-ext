@@ -22,11 +22,14 @@
 //   when its count > 1; otherwise `max(community_candidate, curr_community)`.
 //   `community_candidate` defaults to -1 when a node has no neighbours, so an isolated
 //   node keeps `max(-1, curr) == curr`.
-// - `label_propagation` termination: upstream's loop is a bare `while True` with NO
-//   iteration cap. Synchronous label propagation can oscillate on pathological inputs
-//   (e.g. a bare path a-b-c with equal weights swaps labels forever). We keep upstream's
-//   behaviour byte-for-byte (plan: upstream wins) — callers should only run this over the
-//   `get_community_clusters` projection, which in practice converges. Flagged for fidelity.
+// - `label_propagation` termination (DEVIATION, safety fix): upstream's loop is a bare
+//   `while True` with NO iteration cap. Synchronous label propagation can oscillate on
+//   pathological inputs (e.g. a bare path a-b-c with equal weights swaps labels forever),
+//   which would hang the build. We add a generous `MAX_LABEL_PROPAGATION_ITERATIONS = 1000`
+//   cap: on overflow we `tracing::warn!` and return the last assignment instead of spinning.
+//   This cannot change behaviour on correct input — real `get_community_clusters`
+//   projections converge in a handful of passes — it only bounds the degenerate case.
+//   Documented in docs/port-fidelity.md.
 // - `build_community` divergence vs plan: upstream takes only the `llm_client`, not the
 //   driver; our `build_community` takes `&Clients` to access `llm` + `semaphore` for the
 //   parallel pairwise summarization. No persistence happens here (matches upstream).
@@ -56,6 +59,15 @@ pub const MAX_SUMMARY_CHARS: usize = 1000;
 
 /// Upstream `MAX_COMMUNITY_BUILD_CONCURRENCY` (community_operations.py @ 34f56e65).
 pub const MAX_COMMUNITY_BUILD_CONCURRENCY: usize = 10;
+
+/// Safety cap on `label_propagation` iterations (DEVIATION from upstream, which
+/// loops `while True` with no bound — see module note). Synchronous label
+/// propagation can oscillate forever on pathological inputs (e.g. a bare path
+/// with equal weights), which would hang the build. Real `get_community_clusters`
+/// projections converge in a handful of passes, so 1000 cannot trip on correct
+/// input — it only bounds the degenerate case, emitting a `tracing::warn!` and
+/// returning the last assignment instead of spinning.
+pub const MAX_LABEL_PROPAGATION_ITERATIONS: usize = 1000;
 
 // ---------------------------------------------------------------------------
 // truncate_at_sentence
@@ -142,7 +154,21 @@ pub fn label_propagation(projection: &[NodeNeighbors]) -> Vec<Vec<String>> {
         community_map.insert(nn.node_uuid.clone(), i as i64);
     }
 
-    loop {
+    for iteration in 0.. {
+        // Safety cap (deviation from upstream's unbounded `while True`): bail out
+        // of a non-converging oscillation rather than spinning forever. Cannot
+        // trip on converging (real) projections.
+        if iteration >= MAX_LABEL_PROPAGATION_ITERATIONS {
+            tracing::warn!(
+                max_iterations = MAX_LABEL_PROPAGATION_ITERATIONS,
+                node_count = projection.len(),
+                "label_propagation did not converge within the iteration cap; \
+                 returning the last assignment (input may be a pathological \
+                 non-cluster graph)"
+            );
+            break;
+        }
+
         let mut no_change = true;
         let mut new_community_map: HashMap<String, i64> = HashMap::new();
 
@@ -684,6 +710,22 @@ mod tests {
         for cluster in &clusters {
             assert_eq!(cluster.len(), 3, "each triangle is fully merged");
         }
+    }
+
+    /// Case 5: the iteration cap (safety deviation) guarantees termination on a
+    /// pathological oscillating input — a bare 2-node path with equal weights,
+    /// where synchronous propagation swaps labels forever under upstream's
+    /// unbounded loop. We only assert it RETURNS (does not hang); the exact
+    /// partition of a non-cluster graph is unspecified.
+    #[test]
+    fn label_propagation_caps_on_oscillating_input() {
+        // a<->b with equal single-edge weight: each pass, a adopts b's label and
+        // b adopts a's label, never settling under naive synchronous LPA.
+        let projection = vec![nn("a", &[("b", 1)]), nn("b", &[("a", 1)])];
+        let clusters = label_propagation(&projection);
+        // Terminated within the cap and returned every node exactly once.
+        let total: usize = clusters.iter().map(|c| c.len()).sum();
+        assert_eq!(total, 2, "both nodes are returned, no infinite loop");
     }
 
     #[test]

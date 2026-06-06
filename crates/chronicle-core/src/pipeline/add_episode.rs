@@ -145,11 +145,19 @@ pub async fn add_episode(
     embed_missing_node_names(clients, &mut hydrated_nodes).await?;
     embed_missing_edge_facts(clients, &mut entity_edges).await?;
 
-    // 9. Persist: episode, nodes, entity edges, episodic edges (in that order).
-    clients.driver.save_episode(&episode).await?;
-    clients.driver.save_entity_nodes(&hydrated_nodes).await?;
-    clients.driver.save_entity_edges(&entity_edges).await?;
-    clients.driver.save_episodic_edges(&episodic_edges).await?;
+    // 9. Persist episode + nodes + entity edges + episodic edges atomically.
+    //    `save_all` wraps the four writes in one transaction on transactional
+    //    backends (Neo4j), matching upstream `add_episode`'s single-tx persist;
+    //    the in-memory driver inherits the default sequential save.
+    clients
+        .driver
+        .save_all(
+            std::slice::from_ref(&episode),
+            &episodic_edges,
+            &hydrated_nodes,
+            &entity_edges,
+        )
+        .await?;
 
     // 10. Saga association (upstream `_process_episode_data` saga block runs
     //     immediately after the bulk save, before community updates).

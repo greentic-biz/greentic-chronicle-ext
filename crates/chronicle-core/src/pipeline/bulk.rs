@@ -646,11 +646,12 @@ fn cosine_l2(a: &[f32], b: &[f32]) -> f32 {
 ///
 /// Port of upstream `add_nodes_and_edges_bulk` (bulk_utils.py:128-260).
 ///
-/// **Atomicity gap (documented):** upstream wraps the four saves in a single
-/// write transaction. We use the existing per-collection driver save ops (four
-/// calls), so a mid-batch failure can leave partial state. The transactional save
-/// is Phase-4 Task 7; until then bulk has the same atomicity profile as the
-/// per-episode `add_episode` path.
+/// **Atomicity (closed Phase 4):** upstream wraps the four saves in a single
+/// write transaction. We embed missing node names + edge facts first, then call
+/// the transactional [`crate::driver::BulkSaveOps::save_all`], so a mid-batch
+/// failure rolls back cleanly on a transactional backend (Neo4j). The in-memory
+/// `FakeDriver` inherits the default sequential save (nothing can partially
+/// fail).
 pub async fn add_nodes_and_edges_bulk(
     clients: &Clients,
     episodes: &[EpisodicNode],
@@ -661,12 +662,10 @@ pub async fn add_nodes_and_edges_bulk(
     embed_missing_node_names(clients, nodes).await?;
     embed_missing_edge_facts(clients, edges).await?;
 
-    for episode in episodes {
-        clients.driver.save_episode(episode).await?;
-    }
-    clients.driver.save_entity_nodes(nodes).await?;
-    clients.driver.save_entity_edges(edges).await?;
-    clients.driver.save_episodic_edges(episodic_edges).await?;
+    clients
+        .driver
+        .save_all(episodes, episodic_edges, nodes, edges)
+        .await?;
 
     Ok(())
 }

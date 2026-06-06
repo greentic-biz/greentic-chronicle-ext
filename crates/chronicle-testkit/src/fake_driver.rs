@@ -6,8 +6,9 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
 use chronicle_core::driver::{
-    CommunityOps, DriverError, EntityEdgeOps, EntityNodeOps, EpisodeOps, EpisodicEdgeOps,
-    GraphDriver, GroupClusterProjection, Neighbor, NodeNeighbors, SagaOps, SchemaOps, SearchOps,
+    BulkSaveOps, CommunityOps, DriverError, EntityEdgeOps, EntityNodeOps, EpisodeOps,
+    EpisodicEdgeOps, GraphDriver, GroupClusterProjection, Neighbor, NodeNeighbors, SagaOps,
+    SchemaOps, SearchOps,
 };
 use chronicle_core::search::filters::{ComparisonOperator, DateFilter, SearchFilters};
 use chronicle_core::types::{
@@ -466,6 +467,14 @@ impl EpisodicEdgeOps for FakeDriver {
         Ok(())
     }
 }
+
+// ---------------------------------------------------------------------------
+// BulkSaveOps
+// ---------------------------------------------------------------------------
+
+// In-memory driver: nothing can partially fail, so the default sequential
+// `save_all` (four ops in order) is correct without a real transaction.
+impl BulkSaveOps for FakeDriver {}
 
 // ---------------------------------------------------------------------------
 // SearchOps

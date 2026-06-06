@@ -12,8 +12,8 @@
 //! ```
 
 use chronicle_core::driver::{
-    CommunityOps, EntityEdgeOps, EntityNodeOps, EpisodeOps, EpisodicEdgeOps, GraphDriver, SagaOps,
-    SchemaOps, SearchOps,
+    BulkSaveOps, CommunityOps, EntityEdgeOps, EntityNodeOps, EpisodeOps, EpisodicEdgeOps,
+    GraphDriver, SagaOps, SchemaOps, SearchOps,
 };
 use chronicle_core::search::filters::SearchFilters;
 use chronicle_core::types::{
@@ -1265,6 +1265,119 @@ async fn mentioned_nodes_and_cascade_deletes_live() {
     assert!(d.get_entity_node(&n1.uuid).await.expect("get").is_none());
     d.delete_episode(&ep.uuid).await.expect("del episode");
     assert!(d.get_episode(&ep.uuid).await.expect("get ep").is_none());
+
+    cleanup(&d, &group).await;
+}
+
+#[tokio::test]
+async fn save_all_transactional_persists_full_batch_live() {
+    let d = skip_without_db!();
+    d.build_indices_and_constraints(false).await.expect("build");
+    let group = unique_group();
+
+    // Two entity nodes + one RELATES_TO edge + one episode + one MENTIONS edge,
+    // all persisted in ONE transaction via save_all.
+    let mut a = EntityNode::new("Alice".into(), group.clone(), Utc::now());
+    a.uuid = uuid::Uuid::new_v4().to_string();
+    let mut b = EntityNode::new("Bob".into(), group.clone(), Utc::now());
+    b.uuid = uuid::Uuid::new_v4().to_string();
+
+    let mut edge = EntityEdge::new(
+        a.uuid.clone(),
+        b.uuid.clone(),
+        "KNOWS".into(),
+        "alice knows bob".into(),
+        group.clone(),
+    );
+    edge.uuid = uuid::Uuid::new_v4().to_string();
+
+    let mut ep = EpisodicNode::new(
+        "ep".into(),
+        group.clone(),
+        EpisodeType::Message,
+        "d".into(),
+        "alice knows bob".into(),
+        Utc::now(),
+        Utc::now(),
+    );
+    ep.uuid = uuid::Uuid::new_v4().to_string();
+
+    let mention = EpisodicEdge::new(ep.uuid.clone(), a.uuid.clone(), group.clone(), Utc::now());
+
+    d.save_all(
+        std::slice::from_ref(&ep),
+        std::slice::from_ref(&mention),
+        &[a.clone(), b.clone()],
+        std::slice::from_ref(&edge),
+    )
+    .await
+    .expect("save_all commit");
+
+    // Every collection landed.
+    assert!(d.get_entity_node(&a.uuid).await.expect("get a").is_some());
+    assert!(d.get_entity_node(&b.uuid).await.expect("get b").is_some());
+    assert!(d.get_episode(&ep.uuid).await.expect("get ep").is_some());
+    let between = d
+        .get_edges_between_nodes(&a.uuid, &b.uuid)
+        .await
+        .expect("between");
+    assert!(between.iter().any(|e| e.uuid == edge.uuid));
+    let mentioned = d
+        .get_mentioned_nodes(&[ep.uuid.clone()])
+        .await
+        .expect("mentioned");
+    assert!(mentioned.iter().any(|n| n.uuid == a.uuid));
+
+    cleanup(&d, &group).await;
+}
+
+#[tokio::test]
+async fn save_all_rolls_back_on_mid_batch_failure_live() {
+    let d = skip_without_db!();
+    d.build_indices_and_constraints(false).await.expect("build");
+    let group = unique_group();
+
+    // The episode statement runs first and would succeed on its own; the entity
+    // node carries an EMPTY name_embedding, which `db.create.setNodeVectorProperty`
+    // rejects at runtime. Because save_all shares one transaction, the whole batch
+    // — including the already-applied episode write — must roll back.
+    let mut ep = EpisodicNode::new(
+        "rollback-ep".into(),
+        group.clone(),
+        EpisodeType::Message,
+        "d".into(),
+        "should not persist".into(),
+        Utc::now(),
+        Utc::now(),
+    );
+    ep.uuid = uuid::Uuid::new_v4().to_string();
+
+    let mut bad = EntityNode::new("Bad".into(), group.clone(), Utc::now());
+    bad.uuid = uuid::Uuid::new_v4().to_string();
+    bad.name_embedding = Some(Vec::new()); // empty vector → runtime error
+
+    let result = d
+        .save_all(
+            std::slice::from_ref(&ep),
+            &[],
+            std::slice::from_ref(&bad),
+            &[],
+        )
+        .await;
+    assert!(result.is_err(), "save_all must fail on empty vector");
+
+    // Neither the episode nor the entity node may have been committed.
+    assert!(
+        d.get_episode(&ep.uuid).await.expect("get ep").is_none(),
+        "episode write must have rolled back"
+    );
+    assert!(
+        d.get_entity_node(&bad.uuid)
+            .await
+            .expect("get bad")
+            .is_none(),
+        "entity node write must have rolled back"
+    );
 
     cleanup(&d, &group).await;
 }

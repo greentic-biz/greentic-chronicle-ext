@@ -1364,7 +1364,10 @@ async fn save_all_rolls_back_on_mid_batch_failure_live() {
             &[],
         )
         .await;
-    assert!(result.is_err(), "save_all must fail on empty vector");
+    assert!(
+        result.is_err(),
+        "save_all must fail when a mid-batch statement rejects (empty embedding)"
+    );
 
     // Neither the episode nor the entity node may have been committed.
     assert!(

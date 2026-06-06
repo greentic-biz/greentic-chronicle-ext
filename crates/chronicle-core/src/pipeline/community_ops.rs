@@ -530,15 +530,19 @@ pub async fn update_community(
 
     let mut community_edges: Vec<CommunityEdge> = Vec::new();
     if is_new {
-        let edge = build_community_edges(std::slice::from_ref(entity), &community, Utc::now())
-            .into_iter()
-            .next()
-            .expect("build_community_edges yields one edge for one member");
-        clients
-            .driver
-            .save_community_edges(std::slice::from_ref(&edge))
-            .await?;
-        community_edges.push(edge);
+        // build_community_edges yields exactly one edge per member; for a single
+        // member that is one edge. Guard defensively rather than expect().
+        if let Some(edge) =
+            build_community_edges(std::slice::from_ref(entity), &community, Utc::now())
+                .into_iter()
+                .next()
+        {
+            clients
+                .driver
+                .save_community_edges(std::slice::from_ref(&edge))
+                .await?;
+            community_edges.push(edge);
+        }
     }
 
     // Regenerate the name embedding (upstream community.generate_name_embedding).

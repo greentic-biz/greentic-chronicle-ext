@@ -304,6 +304,63 @@ pub fn read_attributes(
     }
 }
 
+/// Parse a `Vec<f32>` embedding directly from a positional column value
+/// (`Vec32`, or a numeric `Array`). Used by the embedding loaders, which RETURN
+/// the bare vector column rather than a whole Node. `None`/absent is an error
+/// here — callers guard against null embeddings in the query (`IS NOT NULL`).
+pub fn embedding_from_value(value: &FalkorValue) -> Result<Vec<f32>, DriverError> {
+    match value {
+        FalkorValue::Vec32(v) => Ok(v.values.clone()),
+        FalkorValue::Array(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for x in items {
+                match x {
+                    FalkorValue::F64(f) => out.push(*f as f32),
+                    FalkorValue::I64(i) => out.push(*i as f32),
+                    other => {
+                        return Err(DriverError::Decode(format!(
+                            "expected number in embedding, got {other:?}"
+                        )));
+                    }
+                }
+            }
+            Ok(out)
+        }
+        other => Err(DriverError::Decode(format!(
+            "expected a vector value, got {other:?}"
+        ))),
+    }
+}
+
+/// Read a required string directly from a positional column value.
+pub fn string_from_value(value: &FalkorValue) -> Result<String, DriverError> {
+    match value {
+        FalkorValue::String(s) => Ok(s.clone()),
+        other => Err(DriverError::Decode(format!(
+            "expected a string value, got {other:?}"
+        ))),
+    }
+}
+
+/// Read a required i64 directly from a positional column value.
+pub fn i64_from_value(value: &FalkorValue) -> Result<i64, DriverError> {
+    value
+        .to_i64()
+        .ok_or_else(|| DriverError::Decode(format!("expected an integer value, got {value:?}")))
+}
+
+/// Read a required f64 (e.g. a vector/fulltext `score`) from a positional column
+/// value. Accepts both `F64` and `I64` (a 0/1 score may arrive as an integer).
+pub fn f64_from_value(value: &FalkorValue) -> Result<f64, DriverError> {
+    match value {
+        FalkorValue::F64(f) => Ok(*f),
+        FalkorValue::I64(i) => Ok(*i as f64),
+        other => Err(DriverError::Decode(format!(
+            "expected a number value, got {other:?}"
+        ))),
+    }
+}
+
 // =====================================================================
 // EpisodeType <-> source column
 // =====================================================================
@@ -519,5 +576,30 @@ mod tests {
             read_opt_embedding(&props, "e").unwrap().unwrap(),
             vec![1.0_f32, 2.0]
         );
+    }
+
+    #[test]
+    fn embedding_from_value_parses_numeric_array() {
+        let v = FalkorValue::Array(vec![FalkorValue::F64(1.0), FalkorValue::I64(2)]);
+        assert_eq!(embedding_from_value(&v).unwrap(), vec![1.0_f32, 2.0]);
+        // A non-vector value is a hard decode error (loaders guard null in-query).
+        assert!(embedding_from_value(&FalkorValue::I64(5)).is_err());
+    }
+
+    #[test]
+    fn scalar_from_value_helpers() {
+        assert_eq!(
+            string_from_value(&FalkorValue::String("x".into())).unwrap(),
+            "x"
+        );
+        assert!(string_from_value(&FalkorValue::I64(1)).is_err());
+
+        assert_eq!(i64_from_value(&FalkorValue::I64(7)).unwrap(), 7);
+        assert!(i64_from_value(&FalkorValue::String("7".into())).is_err());
+
+        // f64 reader accepts both F64 and I64 (a 0/1 score may arrive as an int).
+        assert_eq!(f64_from_value(&FalkorValue::F64(0.5)).unwrap(), 0.5);
+        assert_eq!(f64_from_value(&FalkorValue::I64(1)).unwrap(), 1.0);
+        assert!(f64_from_value(&FalkorValue::String("x".into())).is_err());
     }
 }

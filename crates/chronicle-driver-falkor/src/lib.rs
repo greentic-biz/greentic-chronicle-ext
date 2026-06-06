@@ -29,6 +29,7 @@
 //! fails honestly until Tasks 2/3 land.
 
 mod convert;
+mod filters;
 mod schema;
 
 pub use schema::{
@@ -52,10 +53,82 @@ use chronicle_core::types::{
     HasEpisodeEdge, NextEpisodeEdge, SagaNode,
 };
 
-/// Marker for not-yet-implemented (Task 2/3) operations. Loud, never a silent
+/// Marker for not-yet-implemented (Task 3) operations. Loud, never a silent
 /// empty success.
 fn pending(method: &str) -> DriverError {
-    DriverError::Query(format!("phase-6 task-2/3 pending: {method}"))
+    DriverError::Query(format!("phase-6 task-3 pending: {method}"))
+}
+
+/// BFS depth bounds (parity with the Neo4j driver). The depth is inlined into
+/// the var-length pattern `*1..N` (Cypher does not allow a parameter there), so
+/// clamping into `[MIN_BFS_DEPTH, MAX_BFS_DEPTH]` is the injection guard — a
+/// usize that has passed through `clamp` can only render as digits.
+const MIN_BFS_DEPTH: usize = 1;
+const MAX_BFS_DEPTH: usize = 5;
+
+/// Clamp a requested BFS depth into the inline-safe range `[1, 5]` (the plan caps
+/// FalkorDB depth at 5).
+fn clamp_bfs_depth(depth: usize) -> usize {
+    depth.clamp(MIN_BFS_DEPTH, MAX_BFS_DEPTH)
+}
+
+/// Vector-procedure over-fetch: KNN candidate count = `limit * 3`, floor 30. The
+/// vector procedure cannot post-filter inline on min_score / group / labels, so
+/// we over-fetch then filter + truncate in Rust.
+fn overfetch(limit: usize) -> usize {
+    limit.saturating_mul(3).max(30)
+}
+
+/// Build the optional group-scope WHERE fragment for the node alias `n`.
+fn group_scope_node(group_ids: &[String]) -> Vec<String> {
+    if group_ids.is_empty() {
+        Vec::new()
+    } else {
+        vec![format!(
+            "n.group_id IN {}",
+            convert::lit_string_list(group_ids)
+        )]
+    }
+}
+
+/// Build the optional group-scope WHERE fragment for the edge alias `e`.
+fn group_scope_edge(group_ids: &[String]) -> Vec<String> {
+    if group_ids.is_empty() {
+        Vec::new()
+    } else {
+        vec![format!(
+            "e.group_id IN {}",
+            convert::lit_string_list(group_ids)
+        )]
+    }
+}
+
+/// Join WHERE fragments into a ` WHERE a AND b` block (empty → empty string).
+fn where_clause(fragments: &[String]) -> String {
+    if fragments.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", fragments.join(" AND "))
+    }
+}
+
+/// Parse `(uuid, embedding)` rows from an embeddings-loader query into a map.
+fn embeddings_from_rows(
+    rows: Vec<Vec<FalkorValue>>,
+) -> Result<HashMap<String, Vec<f32>>, DriverError> {
+    let mut out = HashMap::with_capacity(rows.len());
+    for row in &rows {
+        let uuid = convert::string_from_value(
+            row.first()
+                .ok_or_else(|| DriverError::Decode("embeddings: empty row".into()))?,
+        )?;
+        let emb = convert::embedding_from_value(
+            row.get(1)
+                .ok_or_else(|| DriverError::Decode("embeddings: missing embedding".into()))?,
+        )?;
+        out.insert(uuid, emb);
+    }
+    Ok(out)
 }
 
 /// FalkorDB-backed `GraphDriver`.
@@ -187,6 +260,64 @@ impl FalkorDriver {
                 .first()
                 .ok_or_else(|| DriverError::Decode(format!("{ctx}: empty row")))?;
             out.push(f(convert::node_props(value)?)?);
+        }
+        Ok(out)
+    }
+
+    /// Collect `(node, score)` rows from a vector-similarity query, converting the
+    /// cosine DISTANCE score to a similarity (`1 - score`), post-filtering
+    /// `sim >= min_score`, and truncating to `limit`. Rows arrive ordered by score
+    /// ASC (closest first), so the order is preserved after truncation.
+    fn collect_scored_nodes<T>(
+        &self,
+        rows: Vec<Vec<FalkorValue>>,
+        min_score: f32,
+        limit: usize,
+        f: impl Fn(&HashMap<String, FalkorValue>) -> Result<T, DriverError>,
+    ) -> Result<Vec<T>, DriverError> {
+        let mut out = Vec::new();
+        for row in &rows {
+            let node = row
+                .first()
+                .ok_or_else(|| DriverError::Decode("scored node: empty row".into()))?;
+            let score = convert::f64_from_value(
+                row.get(1)
+                    .ok_or_else(|| DriverError::Decode("scored node: missing score".into()))?,
+            )?;
+            let similarity = 1.0 - score as f32;
+            if similarity >= min_score {
+                out.push(f(convert::node_props(node)?)?);
+                if out.len() == limit {
+                    break;
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Edge analogue of [`Self::collect_scored_nodes`].
+    fn collect_scored_edges(
+        &self,
+        rows: Vec<Vec<FalkorValue>>,
+        min_score: f32,
+        limit: usize,
+    ) -> Result<Vec<EntityEdge>, DriverError> {
+        let mut out = Vec::new();
+        for row in &rows {
+            let edge = row
+                .first()
+                .ok_or_else(|| DriverError::Decode("scored edge: empty row".into()))?;
+            let score = convert::f64_from_value(
+                row.get(1)
+                    .ok_or_else(|| DriverError::Decode("scored edge: missing score".into()))?,
+            )?;
+            let similarity = 1.0 - score as f32;
+            if similarity >= min_score {
+                out.push(convert::entity_edge_from_props(convert::edge_props(edge)?)?);
+                if out.len() == limit {
+                    break;
+                }
+            }
         }
         Ok(out)
     }
@@ -405,10 +536,24 @@ impl EntityEdgeOps for FalkorDriver {
 
     async fn get_edges_between_nodes(
         &self,
-        _source_uuid: &str,
-        _target_uuid: &str,
+        source_uuid: &str,
+        target_uuid: &str,
     ) -> Result<Vec<EntityEdge>, DriverError> {
-        Err(pending("get_edges_between_nodes"))
+        debug!(source_uuid, target_uuid, "falkor get_edges_between_nodes");
+        // Directed source -> target RELATES_TO (parity with Neo4j
+        // EntityEdge.get_between_nodes).
+        let cypher = format!(
+            "MATCH (n:Entity {{uuid: {}}})-[e:RELATES_TO]->(m:Entity {{uuid: {}}}) RETURN e",
+            convert::lit_str(source_uuid),
+            convert::lit_str(target_uuid)
+        );
+        self.fetch_edges(
+            &cypher,
+            &HashMap::new(),
+            "get_edges_between_nodes",
+            convert::entity_edge_from_props,
+        )
+        .await
     }
 
     async fn get_entity_edges_by_uuids(
@@ -617,104 +762,332 @@ impl BulkSaveOps for FalkorDriver {}
 impl SearchOps for FalkorDriver {
     async fn edge_fulltext_search(
         &self,
-        _query: &str,
-        _filters: &SearchFilters,
-        _group_ids: &[String],
-        _limit: usize,
+        query: &str,
+        filters: &SearchFilters,
+        group_ids: &[String],
+        limit: usize,
     ) -> Result<Vec<EntityEdge>, DriverError> {
-        Err(pending("edge_fulltext_search"))
+        debug!(query, limit, "falkor edge_fulltext_search");
+        if query.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        // Relationship fulltext via the DDL-form index on RELATES_TO.fact.
+        let (rel, _prop) = schema::RELATIONSHIP_FULLTEXT;
+        let mut wheres = group_scope_edge(group_ids);
+        wheres.extend(filters::edge_filter_fragments(filters)?);
+        let where_block = where_clause(&wheres);
+        let cypher = format!(
+            "CALL db.idx.fulltext.queryRelationships('{rel}', {q}) YIELD relationship AS e, score \
+             MATCH (n:Entity)-[e2:RELATES_TO {{uuid: e.uuid}}]->(m:Entity) \
+             WITH e2 AS e, n, m, score{where_block} \
+             RETURN e ORDER BY score DESC LIMIT {lim}",
+            q = convert::lit_str(query),
+            lim = convert::lit_int(limit as i64),
+        );
+        self.fetch_edges(
+            &cypher,
+            &HashMap::new(),
+            "edge_fulltext_search",
+            convert::entity_edge_from_props,
+        )
+        .await
     }
 
     async fn edge_similarity_search(
         &self,
-        _search_vector: &[f32],
-        _filters: &SearchFilters,
-        _group_ids: &[String],
-        _limit: usize,
-        _min_score: f32,
+        search_vector: &[f32],
+        filters: &SearchFilters,
+        group_ids: &[String],
+        limit: usize,
+        min_score: f32,
     ) -> Result<Vec<EntityEdge>, DriverError> {
-        Err(pending("edge_similarity_search"))
+        debug!(limit, min_score, "falkor edge_similarity_search");
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let k = overfetch(limit);
+        let mut wheres = group_scope_edge(group_ids);
+        wheres.extend(filters::edge_filter_fragments(filters)?);
+        let where_block = where_clause(&wheres);
+        // The vector procedure yields (relationship, score=cosine DISTANCE). We
+        // re-MATCH the relationship by uuid so the endpoint aliases n/m exist for
+        // the node-label / group / date filters, then carry score through.
+        let cypher = format!(
+            "CALL db.idx.vector.queryRelationships('RELATES_TO','fact_embedding',{k},{vec}) \
+             YIELD relationship AS rel, score \
+             MATCH (n:Entity)-[e:RELATES_TO {{uuid: rel.uuid}}]->(m:Entity){where_block} \
+             RETURN e, score ORDER BY score ASC",
+            vec = convert::lit_vecf32(search_vector),
+        );
+        let rows = self
+            .fetch_rows(&cypher, &HashMap::new(), "edge_similarity_search")
+            .await?;
+        self.collect_scored_edges(rows, min_score, limit)
     }
 
     async fn node_fulltext_search(
         &self,
-        _query: &str,
-        _filters: &SearchFilters,
-        _group_ids: &[String],
-        _limit: usize,
+        query: &str,
+        filters: &SearchFilters,
+        group_ids: &[String],
+        limit: usize,
     ) -> Result<Vec<EntityNode>, DriverError> {
-        Err(pending("node_fulltext_search"))
+        debug!(query, limit, "falkor node_fulltext_search");
+        if query.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut wheres = group_scope_node(group_ids);
+        wheres.extend(filters::node_filter_fragments(filters)?);
+        let where_block = where_clause(&wheres);
+        let cypher = format!(
+            "CALL db.idx.fulltext.queryNodes('Entity', {q}) YIELD node AS n, score{where_block} \
+             RETURN n ORDER BY score DESC LIMIT {lim}",
+            q = convert::lit_str(query),
+            lim = convert::lit_int(limit as i64),
+        );
+        self.fetch_nodes(
+            &cypher,
+            &HashMap::new(),
+            "node_fulltext_search",
+            convert::entity_node_from_props,
+        )
+        .await
     }
 
     async fn node_similarity_search(
         &self,
-        _search_vector: &[f32],
-        _filters: &SearchFilters,
-        _group_ids: &[String],
-        _limit: usize,
-        _min_score: f32,
+        search_vector: &[f32],
+        filters: &SearchFilters,
+        group_ids: &[String],
+        limit: usize,
+        min_score: f32,
     ) -> Result<Vec<EntityNode>, DriverError> {
-        Err(pending("node_similarity_search"))
+        debug!(limit, min_score, "falkor node_similarity_search");
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let k = overfetch(limit);
+        let mut wheres = group_scope_node(group_ids);
+        wheres.extend(filters::node_filter_fragments(filters)?);
+        let where_block = where_clause(&wheres);
+        let cypher = format!(
+            "CALL db.idx.vector.queryNodes('Entity','name_embedding',{k},{vec}) \
+             YIELD node AS n, score{where_block} \
+             RETURN n, score ORDER BY score ASC",
+            vec = convert::lit_vecf32(search_vector),
+        );
+        let rows = self
+            .fetch_rows(&cypher, &HashMap::new(), "node_similarity_search")
+            .await?;
+        self.collect_scored_nodes(rows, min_score, limit, convert::entity_node_from_props)
     }
 
     async fn node_bfs_search(
         &self,
-        _origins: &[String],
-        _filters: &SearchFilters,
-        _max_depth: usize,
-        _group_ids: &[String],
-        _limit: usize,
+        origins: &[String],
+        filters: &SearchFilters,
+        max_depth: usize,
+        group_ids: &[String],
+        limit: usize,
     ) -> Result<Vec<EntityNode>, DriverError> {
-        Err(pending("node_bfs_search"))
+        debug!(max_depth, limit, "falkor node_bfs_search");
+        if origins.is_empty() || max_depth < 1 || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let depth = clamp_bfs_depth(max_depth);
+        let mut wheres = vec!["n.group_id = origin.group_id".to_string()];
+        if !group_ids.is_empty() {
+            let list = convert::lit_string_list(group_ids);
+            wheres.push(format!("n.group_id IN {list}"));
+            wheres.push(format!("origin.group_id IN {list}"));
+        }
+        wheres.extend(filters::node_filter_fragments(filters)?);
+        let cypher = format!(
+            "UNWIND {origins} AS origin_uuid \
+             MATCH (origin {{uuid: origin_uuid}})-[:RELATES_TO|MENTIONS*1..{depth}]->(n:Entity) \
+             WHERE {wheres} \
+             RETURN DISTINCT n LIMIT {lim}",
+            origins = convert::lit_string_list(origins),
+            wheres = wheres.join(" AND "),
+            lim = convert::lit_int(limit as i64),
+        );
+        self.fetch_nodes(
+            &cypher,
+            &HashMap::new(),
+            "node_bfs_search",
+            convert::entity_node_from_props,
+        )
+        .await
     }
 
     async fn edge_bfs_search(
         &self,
-        _origins: &[String],
-        _max_depth: usize,
-        _filters: &SearchFilters,
-        _group_ids: &[String],
-        _limit: usize,
+        origins: &[String],
+        max_depth: usize,
+        filters: &SearchFilters,
+        group_ids: &[String],
+        limit: usize,
     ) -> Result<Vec<EntityEdge>, DriverError> {
-        Err(pending("edge_bfs_search"))
+        debug!(max_depth, limit, "falkor edge_bfs_search");
+        if origins.is_empty() || max_depth < 1 || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let depth = clamp_bfs_depth(max_depth);
+        let mut wheres = group_scope_edge(group_ids);
+        wheres.extend(filters::edge_filter_fragments(filters)?);
+        let where_block = where_clause(&wheres);
+        // Expand RELATES_TO|MENTIONS paths, then re-MATCH each traversed
+        // RELATES_TO edge by uuid (UNDIRECTED, parity with Neo4j) so the endpoint
+        // aliases exist for filters. Only RELATES_TO edges are returned.
+        let cypher = format!(
+            "UNWIND {origins} AS origin_uuid \
+             MATCH path = (origin {{uuid: origin_uuid}})-[:RELATES_TO|MENTIONS*1..{depth}]->(:Entity) \
+             UNWIND relationships(path) AS rel \
+             MATCH (n:Entity)-[e:RELATES_TO {{uuid: rel.uuid}}]-(m:Entity){where_block} \
+             RETURN DISTINCT e LIMIT {lim}",
+            origins = convert::lit_string_list(origins),
+            lim = convert::lit_int(limit as i64),
+        );
+        self.fetch_edges(
+            &cypher,
+            &HashMap::new(),
+            "edge_bfs_search",
+            convert::entity_edge_from_props,
+        )
+        .await
     }
 
     async fn episode_fulltext_search(
         &self,
-        _query: &str,
-        _group_ids: &[String],
-        _limit: usize,
+        query: &str,
+        group_ids: &[String],
+        limit: usize,
     ) -> Result<Vec<EpisodicNode>, DriverError> {
-        Err(pending("episode_fulltext_search"))
+        debug!(query, limit, "falkor episode_fulltext_search");
+        if query.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let where_block = if group_ids.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " WHERE n.group_id IN {}",
+                convert::lit_string_list(group_ids)
+            )
+        };
+        let cypher = format!(
+            "CALL db.idx.fulltext.queryNodes('Episodic', {q}) YIELD node AS n, score{where_block} \
+             RETURN n ORDER BY score DESC LIMIT {lim}",
+            q = convert::lit_str(query),
+            lim = convert::lit_int(limit as i64),
+        );
+        self.fetch_nodes(
+            &cypher,
+            &HashMap::new(),
+            "episode_fulltext_search",
+            convert::episodic_node_from_props,
+        )
+        .await
     }
 
     async fn get_embeddings_for_nodes(
         &self,
-        _uuids: &[String],
+        uuids: &[String],
     ) -> Result<HashMap<String, Vec<f32>>, DriverError> {
-        Err(pending("get_embeddings_for_nodes"))
+        debug!(count = uuids.len(), "falkor get_embeddings_for_nodes");
+        if uuids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let cypher = format!(
+            "MATCH (n:Entity) WHERE n.uuid IN {} AND n.name_embedding IS NOT NULL \
+             RETURN DISTINCT n.uuid, n.name_embedding",
+            convert::lit_string_list(uuids)
+        );
+        let rows = self
+            .fetch_rows(&cypher, &HashMap::new(), "get_embeddings_for_nodes")
+            .await?;
+        embeddings_from_rows(rows)
     }
 
     async fn get_embeddings_for_edges(
         &self,
-        _uuids: &[String],
+        uuids: &[String],
     ) -> Result<HashMap<String, Vec<f32>>, DriverError> {
-        Err(pending("get_embeddings_for_edges"))
+        debug!(count = uuids.len(), "falkor get_embeddings_for_edges");
+        if uuids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let cypher = format!(
+            "MATCH (n:Entity)-[e:RELATES_TO]-(m:Entity) \
+             WHERE e.uuid IN {} AND e.fact_embedding IS NOT NULL \
+             RETURN DISTINCT e.uuid, e.fact_embedding",
+            convert::lit_string_list(uuids)
+        );
+        let rows = self
+            .fetch_rows(&cypher, &HashMap::new(), "get_embeddings_for_edges")
+            .await?;
+        embeddings_from_rows(rows)
     }
 
     async fn nodes_connected_to_center(
         &self,
-        _node_uuids: &[String],
-        _center_uuid: &str,
+        node_uuids: &[String],
+        center_uuid: &str,
     ) -> Result<Vec<String>, DriverError> {
-        Err(pending("nodes_connected_to_center"))
+        debug!(count = node_uuids.len(), "falkor nodes_connected_to_center");
+        if node_uuids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // 1-hop UNDIRECTED RELATES_TO adjacency (parity with Neo4j).
+        let cypher = format!(
+            "UNWIND {nodes} AS node_uuid \
+             MATCH (center:Entity {{uuid: {center}}})-[:RELATES_TO]-(n:Entity {{uuid: node_uuid}}) \
+             RETURN node_uuid",
+            nodes = convert::lit_string_list(node_uuids),
+            center = convert::lit_str(center_uuid),
+        );
+        let rows = self
+            .fetch_rows(&cypher, &HashMap::new(), "nodes_connected_to_center")
+            .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let value = row.first().ok_or_else(|| {
+                DriverError::Decode("nodes_connected_to_center: empty row".into())
+            })?;
+            out.push(convert::string_from_value(value)?);
+        }
+        Ok(out)
     }
 
     async fn episode_mention_counts(
         &self,
-        _node_uuids: &[String],
+        node_uuids: &[String],
     ) -> Result<HashMap<String, u64>, DriverError> {
-        Err(pending("episode_mention_counts"))
+        debug!(count = node_uuids.len(), "falkor episode_mention_counts");
+        if node_uuids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let cypher = format!(
+            "UNWIND {nodes} AS node_uuid \
+             MATCH (episode:Episodic)-[r:MENTIONS]->(n:Entity {{uuid: node_uuid}}) \
+             RETURN n.uuid, count(*)",
+            nodes = convert::lit_string_list(node_uuids),
+        );
+        let rows = self
+            .fetch_rows(&cypher, &HashMap::new(), "episode_mention_counts")
+            .await?;
+        let mut out = HashMap::with_capacity(rows.len());
+        for row in &rows {
+            let uuid =
+                convert::string_from_value(row.first().ok_or_else(|| {
+                    DriverError::Decode("episode_mention_counts: empty row".into())
+                })?)?;
+            let count = convert::i64_from_value(row.get(1).ok_or_else(|| {
+                DriverError::Decode("episode_mention_counts: missing count".into())
+            })?)?;
+            out.insert(uuid, count.max(0) as u64);
+        }
+        Ok(out)
     }
 }
 

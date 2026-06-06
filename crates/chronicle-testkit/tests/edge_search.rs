@@ -126,6 +126,9 @@ async fn edge_search_no_edge_config_returns_empty() {
 
     let config = SearchConfig {
         edge_config: None,
+        node_config: None,
+        episode_config: None,
+        community_config: None,
         limit: 10,
         reranker_min_score: 0.0,
     };
@@ -153,6 +156,9 @@ async fn edge_search_bm25_only() {
             mmr_lambda: 0.5,
             bfs_max_depth: 3,
         }),
+        node_config: None,
+        episode_config: None,
+        community_config: None,
         limit: 10,
         reranker_min_score: 0.0,
     };
@@ -187,6 +193,9 @@ async fn edge_search_cosine_only() {
             mmr_lambda: 0.5,
             bfs_max_depth: 3,
         }),
+        node_config: None,
+        episode_config: None,
+        community_config: None,
         limit: 10,
         reranker_min_score: 0.0,
     };

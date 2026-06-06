@@ -108,9 +108,18 @@ pub async fn edge_search(
         .map(|l| l.iter().map(|e| e.uuid.clone()).collect())
         .collect();
 
-    // Rerank. Only RRF is implemented in Phase 1.
+    // Rerank. RRF is the only reranker wired in Phase 1.
+    // Mmr, NodeDistance, EpisodeMentions, CrossEncoder are implemented in Phase 2
+    // (Task 3: rerankers; Task 5: scope search wiring). Until then, invoking a
+    // Phase-2 reranker falls back to RRF so that the config types can be used
+    // in recipes without compile errors. Phase-5 callers that pass these configs
+    // will get RRF results until the full reranker dispatch lands.
     let rank_const = match edge_config.reranker {
-        EdgeReranker::Rrf => 1usize,
+        EdgeReranker::Rrf
+        | EdgeReranker::Mmr
+        | EdgeReranker::NodeDistance
+        | EdgeReranker::EpisodeMentions
+        | EdgeReranker::CrossEncoder => 1usize,
     };
     let (ranked, _scores) = rrf(&uuid_lists, rank_const, config.reranker_min_score);
 

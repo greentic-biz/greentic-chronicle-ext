@@ -36,13 +36,22 @@ Statuses:
 | `crates/chronicle-core/src/pipeline/dedup_helpers.rs` | `graphiti_core/utils/maintenance/dedup_helpers.py` | verbatim | `normalize_name`, `shingles`, `minhash`, `jaccard`, `lsh_candidate_indices`, `high_entropy`, `entropy` — all algorithmic logic ported verbatim including constants (`MINHASH_PERMUTATIONS=32`, `MINHASH_BAND_SIZE=4`, `FUZZY_JACCARD_THRESHOLD=0.9`, `NAME_ENTROPY_THRESHOLD=1.5`). |
 | `crates/chronicle-core/src/pipeline/temporal.rs` | `graphiti_core/utils/maintenance/edge_operations.py` (temporal section) | verbatim | `invalidate_edges` bi-temporal invalidation logic ported verbatim; interval-overlap predicate identical. |
 | `crates/chronicle-core/src/pipeline/node_ops.rs` | `graphiti_core/utils/maintenance/node_operations.py` | adapted | `extract_nodes`, `resolve_extracted_nodes` ported. Candidate-input gathering is sequential vs upstream `semaphore_gather` (deviation #4). Node summary hydration uses single-node summarize_context (deviation #8). Multi-episode extraction path, `_collapse_exact_duplicate_extracted_nodes`, `node_episode_index_map` are Phase 2 (deferred). |
-| `crates/chronicle-core/src/pipeline/edge_ops.rs` | `graphiti_core/utils/maintenance/edge_operations.py` | adapted | `extract_edges`, `resolve_extracted_edges`, `resolve_extracted_edge`, `hydrate_node_summaries`. Edge candidate re-ranking via `EDGE_HYBRID_SEARCH_RRF + SearchFilters(edge_uuids)` is Phase 2 (deviation #3). |
+| `crates/chronicle-core/src/pipeline/edge_ops.rs` | `graphiti_core/utils/maintenance/edge_operations.py` | adapted | `extract_edges`, `resolve_extracted_edges`, `resolve_extracted_edge`, `hydrate_node_summaries`. Edge candidate re-ranking via `EDGE_HYBRID_SEARCH_RRF + SearchFilters(edge_uuids)` now ported faithfully — **D-3 CLOSED** (upstream 392-405). |
 | `crates/chronicle-core/src/pipeline/add_episode.rs` | `graphiti_core/graphiti.py::add_episode`, `_extract_and_resolve_edges`, `_process_episode_data`, `bulk_utils.py::resolve_edge_pointers` | adapted | Full single-episode core loop. Persist = 4 sequential driver calls (deviation #5). Community updates, sagas, excluded entity types, multi-episode bulk path are Phase 2+. |
 | `crates/chronicle-core/src/pipeline/mod.rs` | `graphiti_core/utils/maintenance/` | adapted | Module re-exports; no direct behavior. |
 | `crates/chronicle-core/src/search/rrf.rs` | `graphiti_core/search/search_utils.py::rrf` (lines ~1780-1795) | verbatim | RRF rank-fusion formula `1 / (rank + rank_const)` with upstream default `rank_const=1` (NOT the IR-conventional 60); inclusive `>=` min-score filter verbatim; first-seen tie order replicates Python dict insertion-order semantics. |
-| `crates/chronicle-core/src/search/config.rs` | `graphiti_core/search/search_config.py` | adapted | `EdgeSearchConfig`, constants (`DEFAULT_SEARCH_LIMIT=10`, `DEFAULT_MIN_SCORE=0.6`, `DEFAULT_MMR_LAMBDA=0.5`, `MAX_SEARCH_DEPTH=3`) verbatim. `NodeSearchConfig`/`EpisodeSearchConfig`/`CommunitySearchConfig` deferred. |
-| `crates/chronicle-core/src/search/edge_search.rs` | `graphiti_core/search/search.py::edge_search` | adapted | BM25 + CosineSimilarity + RRF path complete. BFS Phase 2 (deferred). `SearchFilters` wiring Phase 2. Parallel execution via `tokio::join!` for two-method case; `semaphore_gather` equivalent for 3+ methods is Phase 2. |
-| `crates/chronicle-core/src/chronicle.rs` | `graphiti_core/graphiti.py::Graphiti` | adapted | `Chronicle` facade: `add_episode`, `retrieve_episodes`, `search`, `build_indices_and_constraints`. `build_communities`, `search_nodes`, batch operations deferred. |
+| `crates/chronicle-core/src/search/config.rs` | `graphiti_core/search/search_config.py` | adapted | `EdgeSearchConfig`, `NodeSearchConfig`, `EpisodeSearchConfig` + full reranker enums (Edge/Node: Rrf/Mmr/NodeDistance/EpisodeMentions/CrossEncoder; Episode: Rrf/CrossEncoder) and method enums (incl. `BreadthFirstSearch`). Constants (`DEFAULT_SEARCH_LIMIT=10`, `DEFAULT_MIN_SCORE=0.6`, `DEFAULT_MMR_LAMBDA=0.5`, `MAX_SEARCH_DEPTH=3`) verbatim. `community_config` deferred to Phase 4 (D-16). |
+| `crates/chronicle-core/src/search/filters.rs` | `graphiti_core/search/search_filters.py` | adapted | `SearchFilters`/`DateFilter`/`ComparisonOperator`/`PropertyFilter`. Date filters are `Vec<Vec<DateFilter>>` (OUTER OR of INNER AND). `property_filters` ported but never applied in WHERE construction (D-17 — upstream dead field at this commit). |
+| `crates/chronicle-core/src/search/recipes.rs` | `graphiti_core/search/search_config_recipes.py` | adapted | Full recipe set (edge/node/combined RRF/MMR/NodeDistance/EpisodeMentions/CrossEncoder). `*_CROSS_ENCODER` use bm25+sim+bfs methods; EDGE/NODE_CROSS_ENCODER limit 10; COMBINED_MMR uses mmr_lambda=1.0 for edge/node. `community_config` always `None` (D-16). |
+| `crates/chronicle-core/src/search/edge_search.rs` | `graphiti_core/search/search.py::edge_search` + `search_utils.py` | adapted | All 5 rerankers (rrf/mmr/node_distance/episode_mentions/cross_encoder), BFS self-seed, 2*limit candidate fetch, `SearchFilters` wiring complete. node_distance edge-scope expands edge-uuid groups in returned node order; score-list mismatch carried bug-for-bug (D-21). Missing center → `InvalidInput`. |
+| `crates/chronicle-core/src/search/node_search.rs` | `graphiti_core/search/search.py::node_search` | adapted | Node rerankers per R4 (cross_encoder ranks `node.name`, no pre-truncate; episode_mentions DB-count via `episode_mention_counts`; node_distance rrf-presort). BFS self-seed from node uuids. |
+| `crates/chronicle-core/src/search/episode_search.rs` | `graphiti_core/search/search.py::episode_search` | adapted | bm25-only fulltext; rrf + cross_encoder (rrf-presort → take limit → rank `episode.content`). |
+| `crates/chronicle-core/src/search/rerank.rs` | `graphiti_core/search/search_utils.py` | verbatim | `maximal_marginal_relevance`, `node_distance_rerank`, `episode_mentions_rerank` (D-15 quirk). |
+| `crates/chronicle-core/src/search/search.rs` | `graphiti_core/search/search.py::search` | adapted | Top-level multi-scope entrypoint; empty-query guard, single embed decision, parallel scopes via `tokio::join!`. Community scope deferred (D-16). `SearchResults` omits community fields (D-16 shape divergence). |
+| `crates/chronicle-core/src/cross_encoder/mod.rs` | `graphiti_core/cross_encoder/client.py` | adapted | `CrossEncoderClient` trait (`rank(query, passages) -> desc-sorted (passage, score)`). |
+| `crates/chronicle-llm-openai/src/reranker.rs` | `graphiti_core/cross_encoder/openai_reranker_client.py` | adapted | OpenAI boolean-logprob reranker (gpt-4.1-nano, temperature 0, logit_bias True/False token ids, top_logprobs 2; score = exp(lp) if "true" else 1-exp(lp), desc sort). Uses deprecated `max_tokens` request field (D-20). |
+| `crates/chronicle-core/src/search/edge_search.rs` (BFS) / `crates/chronicle-driver-neo4j/src/queries.rs` (BFS Cypher) | `graphiti_core/search/search_utils.py::*_bfs` | adapted | Edge-BFS undirected re-join (`(n)-[e]-(m)`) carries upstream duplicate-row behaviour bug-for-bug (D-19). Var-length depth inlined as sanitized integer (not a `$param`). |
+| `crates/chronicle-core/src/chronicle.rs` | `graphiti_core/graphiti.py::Graphiti` | adapted | `Chronicle` facade: `add_episode`, `retrieve_episodes`, `search` (config-direct), `search_with_center` (R13 recipe-routing), `search_` (R13 advanced multi-scope, default COMBINED_HYBRID_SEARCH_CROSS_ENCODER), `with_cross_encoder` builder, `build_indices_and_constraints`. `build_communities`, batch operations deferred (Phase 4). |
 | `crates/chronicle-driver-neo4j/src/lib.rs` | `graphiti_core/driver/neo4j_driver.py` + operations files | adapted | Full `GraphDriver` impl over `neo4rs`. Cross-call atomicity gap documented (deviation #5). |
 | `crates/chronicle-driver-neo4j/src/queries.rs` | `graphiti_core/driver/neo4j/` query builders + `graph_data_operations.py::retrieve_episodes` + `search_utils.py::fulltext_query` | adapted | Cypher query builders. Lucene OR-precedence quirk reproduced bug-for-bug (deviation #6). `validate_group_id` pattern `^[a-zA-Z0-9_-]+$` verbatim from upstream. `MAX_QUERY_LENGTH=128` verbatim. Retrieve episodes tie order is backend-dependent (deviation #12). |
 | `crates/chronicle-driver-neo4j/src/convert.rs` | (Neo4j ↔ domain type conversions, no direct upstream equivalent) | adapted | Bolt value ↔ Rust type bridge; no upstream analog. |
@@ -70,9 +79,9 @@ Affected: `edge_ops.rs::python_repr_str`.
 
 Upstream `dedupe_edges.py` constructs the LLM context as `str({"edge": ...})` — Python's dict repr. This crate implements `python_repr_str` to reproduce CPython's repr behavior: default single-quoted strings, switch to double quotes when the string contains an apostrophe but no double quote, and escape control characters (`\n`, `\r`, `\t`, `\0`, `\x85` NEL, `\xa0` NBSP, `\x7f` DEL) in the same way CPython does. This is a deliberate bug-for-bug replication to keep prompt input identical for existing graphs. Tested in `edge_ops::tests::python_repr_str_*`.
 
-### D-3: Edge candidate re-ranking: node-pair pool used directly, ordering may differ
+### D-3: Edge candidate re-ranking — **CLOSED (Phase 2)**
 
-Upstream `resolve_extracted_edges` re-ranks the node-pair candidate pool via `EDGE_HYBRID_SEARCH_RRF + SearchFilters(edge_uuids)` before resolution. Phase-1 uses the node-pair pool directly, capped at `RELEVANT_SCHEMA_LIMIT`. The same set of edges is examined; input ordering to the resolver may differ from upstream. Phase-2 improvement: wire `SearchFilters(edge_uuids)` into `edge_search`.
+Status: **CLOSED**. Upstream `resolve_extracted_edges` (edge_operations.py:392-405) re-ranks the node-pair candidate pool via `EDGE_HYBRID_SEARCH_RRF` filtered to the pool's UUIDs (`SearchFilters(edge_uuids=[...])`) before resolution. Phase-1 used the pool directly (same SET, possibly different order). Phase-2 ports the faithful path: `get_edges_between_nodes` is the UUID *source*; a group-scoped RRF hybrid edge search on `extracted_edge.fact` with `SearchFilters { edge_uuids: Some(pool_uuids), .. }` produces the ranked `related_edges`. An empty pool short-circuits to no candidates (no search issued) — observably identical to upstream's empty-`edge_uuids` search (both yield no related edges), recorded here as a micro-deviation. The invalidation-candidate search keeps explicit empty `SearchFilters` (upstream `SearchFilters()`), minus any UUID already in the related pool. The LLM call sequence is unchanged; only embedder/search call counts increase (one extra edge search per non-empty pool). e2e `add_episode_e2e` (both tests) green — they assert LLM call counts only.
 
 ### D-4: Candidate-input gathering: sequential vs upstream semaphore_gather (performance only)
 
@@ -122,6 +131,39 @@ Upstream `retrieve_episodes` returns episodes in `created_at DESC` order; ties w
 
 Upstream `_build_episode_context` in `graphiti.py` formats `episode.valid_at` which is nullable (`Optional[datetime]`); when `None`, it formats as `"None"`. `EpisodicNode.valid_at` in this crate is non-optional (`DateTime<Utc>`), so the timestamp is always a formatted string. Episodes from older upstream graphs with `null` valid_at cannot be ingested via this crate without a pre-migration step.
 
+### D-15: episode_mentions reranker — ASC sort + inf-retain quirk (bug-for-bug)
+
+`episode_mentions_rerank` (`crates/chronicle-core/src/search/rerank.rs`) ports `episode_mentions_reranker` (`graphiti_core/search/search_utils.py` @ 34f56e65) exactly, including two counterintuitive upstream behaviours ("episode_mentions ASC quirk"):
+
+1. **Ascending sort by mention count** — `sorted_uuids.sort(key=lambda u: scores[u])` orders nodes with *fewer* MENTIONS first. This is the opposite of the intuitive "most-mentioned is most relevant" ordering, but is exactly what upstream does, so it is reproduced.
+2. **Unmentioned nodes retained at the end** — nodes with no MENTIONS get `float('inf')`, and the literal filter `scores[uuid] >= min_score` keeps them (`inf >= min_score` is always true). The returned scores are the raw counts / `inf`, not inverted. Reproduced literally.
+
+Both `node_distance_rerank` and `maximal_marginal_relevance` in the same module are faithful ports with no behavioural deviation (the only adaptation is `f32` embeddings widened to `f64` before arithmetic, matching upstream numpy float64). `normalize_l2`'s zero-vector guard (`np.where(norm == 0, arr, arr / norm)` → zero vector returned unchanged) is reproduced.
+
+### D-16: Community scope + SearchResults shape deferred to Phase 4
+
+`SearchConfig::community_config` is always `None` in every recipe (combined recipes ship `community_config: None` with a pointer comment), and `SearchResults` omits the community edges/nodes/scores fields entirely (upstream `SearchResults` carries `communities` + `community_reranker_scores`). Upstream `community_search` returns empty when its config is `None`, so the gate is clean and behaviour-equivalent for the supported scopes; the struct *shape* differs (fewer fields). Community types, `build_communities`, and the COMMUNITY_* recipes (incl. `COMMUNITY_CROSS_ENCODER` limit 3) land in Phase 4.
+
+### D-17: `property_filters` ported but never applied (upstream dead field)
+
+`SearchFilters::property_filters` exists for recipe/struct-shape parity but is NOT consumed in any WHERE-clause construction — because upstream at 34f56e65 also never reads it in its Neo4j WHERE builders (a dead field upstream at this commit). Carried as a field-shape match; flagged so a future upstream activation is noticed.
+
+### D-18: Date-param collision — **upstream bug FIXED in this port**
+
+This is the one place the port deliberately *diverges to be correct* rather than bug-for-bug. Upstream's edge/node date-filter WHERE builders name bound params by the INNER (per-AND-group) index only (`$valid_at_{j}`), which COLLIDES across OR-groups (group 2's `valid_at_0` overwrites group 1's) and across the four date fields in the same call. Upstream's fixtures never exercise multi-group OR-of-ANDs windows, so the bug is latent there. The R10 requirement (correct OR-of-ANDs date windows) forces a fix: every value-bearing date condition gets a GLOBALLY-unique `$p{n}` name from one monotonic counter shared across all four fields. The emitted Cypher SHAPE is identical (`((e.valid_at >= $p0 AND e.valid_at < $p1) OR (...))`); only the param identifiers are made unique. Documented inline in `queries.rs`.
+
+### D-19: Edge-BFS undirected re-join — duplicate rows carried bug-for-bug
+
+`edge_bfs` expands a directed var-length path, then re-matches each relationship UNDIRECTED (`(n:Entity)-[e:RELATES_TO {uuid: rel.uuid}]-(m:Entity)`). The undirected re-join can surface the same edge from both endpoint orientations, producing duplicate result rows for the same edge uuid — exactly as upstream does. Reproduced bug-for-bug so result multiplicity matches upstream-generated graphs (downstream RRF/dedup absorbs the duplicates).
+
+### D-20: OpenAI reranker uses deprecated `max_tokens` request field
+
+`chronicle-llm-openai/src/reranker.rs` sends `max_tokens: 1` (matching upstream `openai_reranker_client.py`). OpenAI has since deprecated `max_tokens` in favour of `max_completion_tokens` for chat completions, but upstream still emits `max_tokens` at 34f56e65, so the port mirrors it for byte-faithful request shape. If the OpenAI endpoint hard-rejects the field in future, switch to `max_completion_tokens` (semantics identical for the 1-token logprob classifier).
+
+### D-21: node_distance edge-scope score-list mismatch carried bug-for-bug
+
+In the edge-scope `node_distance` reranker, upstream groups edge uuids by `source_node_uuid`, reranks the *source nodes* via `node_distance_reranker`, then expands back to edge uuids in returned-node order — but the returned score list is the per-*node* distance scores, not per-edge, so the edge-score alignment after expansion does not 1:1 track the expanded edge uuids. The port reproduces this expansion + score-list behaviour exactly (bug-for-bug) rather than re-deriving per-edge scores. The final `[:limit]` slice and downstream consumers tolerate the mismatch identically to upstream.
+
 ---
 
 ## DEFERRED
@@ -131,17 +173,20 @@ Features acknowledged but out of Phase-1 scope. Listed with target phase.
 | Feature | Target | Notes |
 |---|---|---|
 | Reflexion (self-critique loop) | absent in upstream v0.29.1 | Not present in pinned upstream; not applicable |
-| Communities / saga / bulk ingest | Phase 4 | `build_communities`, `build_community_for_node`, community edge/node types |
-| BFS traversal in edge search | Phase 2 | `EdgeSearchMethod::BreadthFirstSearch` stub present; implementation deferred |
-| MMR / CrossEncoder / NodeDistance / EpisodeMentions rerankers | Phase 2 | Enum variants present; wiring deferred |
-| `SearchFilters` wiring in edge_search | Phase 2 | Needed for edge candidate re-ranking (D-3) |
-| Multi-episode extraction path | Phase 2 | `_process_episode_data` bulk path; `_collapse_exact_duplicate_extracted_nodes`; `node_episode_index_map` |
-| Entity/edge-type registries + attribute extraction | Phase 2 | `entity_types` and `edge_types` Pydantic registry; `extract_attributes_from_nodes` batch path |
-| `extract_summaries_batch` / `SummarizedEntities` | Phase 2 | Replace per-node hydration (D-8) |
-| `SearchFilters(edge_uuids)` in resolve_extracted_edges | Phase 2 | Edge candidate re-ranking improvement (D-3) |
-| `save_all` transactional driver op | Phase 2 | Atomicity gap (D-5) |
-| `semaphore_gather` equivalent fan-out | Phase 2 | Performance improvement for D-4 |
-| `NodeSearchConfig`, `EpisodeSearchConfig`, `CommunitySearchConfig` | Phase 2 | Config stubs not yet implemented |
+| Communities / saga / bulk ingest | Phase 4 | `build_communities`, `build_community_for_node`, community edge/node types, `community_config`, COMMUNITY_* recipes, `SearchResults` community fields (D-16) |
+| BFS traversal in edge/node search | ✅ Done (Phase 2) | `EdgeSearchMethod::BreadthFirstSearch` + node BFS implemented (self-seed + Cypher); see D-19 |
+| MMR / NodeDistance / EpisodeMentions rerankers | ✅ Done (Phase 2) | Ported in `search/rerank.rs` (D-15, D-21) + dispatched in edge/node scopes |
+| CrossEncoder reranker | ✅ Done (Phase 2) | `CrossEncoderClient` trait + OpenAI logprob impl (D-20) + scope wiring |
+| `SearchFilters` wiring in edge/node search | ✅ Done (Phase 2) | `filters.rs` (D-17) wired into all scopes + Neo4j WHERE builders (D-18) |
+| `SearchFilters(edge_uuids)` in resolve_extracted_edges | ✅ Done (Phase 2) | Edge candidate re-ranking — D-3 CLOSED |
+| `NodeSearchConfig`, `EpisodeSearchConfig` | ✅ Done (Phase 2) | Full config + reranker enums |
+| Top-level `search_()` / multi-scope facade | ✅ Done (Phase 2) | `Chronicle::search_`, `search_with_center`, `with_cross_encoder` (R13) |
+| `CommunitySearchConfig` | Phase 4 | Deferred with community scope (D-16) |
+| Multi-episode extraction path | Phase 3 | `_process_episode_data` bulk path; `_collapse_exact_duplicate_extracted_nodes`; `node_episode_index_map` |
+| Entity/edge-type registries + attribute extraction | Phase 3 | `entity_types` and `edge_types` Pydantic registry; `extract_attributes_from_nodes` batch path |
+| `extract_summaries_batch` / `SummarizedEntities` | Phase 3 | Replace per-node hydration (D-8) |
+| `save_all` transactional driver op | Phase 3 | Atomicity gap (D-5) |
+| `semaphore_gather` equivalent fan-out | Phase 3 | Performance improvement for D-4 |
 | `fact_triple` EpisodeType variant | Near-term patch | Read-compat gap (D-7) |
 | Kuzu embedded driver | Phase 3 | `chronicle-driver-kuzu` crate not yet created |
 | FalkorDB driver | v1.x | Planned post-v1 |

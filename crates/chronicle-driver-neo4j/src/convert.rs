@@ -28,7 +28,12 @@ use serde_json::{Map, Number, Value};
 // ---------------------------------------------------------------------
 
 /// `DateTime<Utc>` -> a `BoltType::DateTime` param value.
-fn datetime_to_bolt(dt: DateTime<Utc>) -> BoltType {
+///
+/// Exposed `pub(crate)` so the filter-fragment builder in `queries.rs` can bind
+/// `DateFilter` dates as the SAME `BoltType::DateTime` wire form used everywhere
+/// else (so `e.valid_at <op> $p0` compares datetime-to-datetime, not against a
+/// string).
+pub(crate) fn datetime_to_bolt(dt: DateTime<Utc>) -> BoltType {
     let fixed: DateTime<FixedOffset> = dt.fixed_offset();
     BoltType::from(fixed)
 }
@@ -191,6 +196,22 @@ fn read_opt_embedding(row: &Row, col: &str) -> Result<Option<Vec<f32>>, DriverEr
         other => Err(DriverError::Decode(format!(
             "expected list for embedding '{col}', got {other:?}"
         ))),
+    }
+}
+
+/// Read a `(uuid, embedding)` pair from an embeddings-loader row
+/// (`GET_NODE_EMBEDDINGS` / `GET_EDGE_EMBEDDINGS`). The Cypher already guards
+/// `embedding IS NOT NULL`, so a row here is expected to carry a non-null vector;
+/// a null/absent embedding maps to `None` (the caller then omits the uuid),
+/// preserving the upstream "omit-when-missing" contract even if a backend returns
+/// a stray null.
+pub(crate) fn embedding_row(row: &Row) -> Result<Option<(String, Vec<f32>)>, DriverError> {
+    let uuid: String = row
+        .get("uuid")
+        .map_err(|e| DriverError::Decode(format!("embedding row missing uuid: {e}")))?;
+    match read_opt_embedding(row, "embedding")? {
+        Some(emb) => Ok(Some((uuid, emb))),
+        None => Ok(None),
     }
 }
 

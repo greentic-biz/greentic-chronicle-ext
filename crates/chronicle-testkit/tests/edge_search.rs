@@ -9,7 +9,8 @@ use chronicle_core::embedder::EmbedderClient;
 use chronicle_core::search::config::{
     EdgeReranker, EdgeSearchConfig, EdgeSearchMethod, SearchConfig, edge_hybrid_search_rrf,
 };
-use chronicle_core::search::edge_search::edge_search;
+use chronicle_core::search::edge_search::edge_search_simple;
+use chronicle_core::search::filters::SearchFilters;
 use chronicle_core::types::EntityEdge;
 
 use chronicle_testkit::{FakeDriver, MockEmbedder};
@@ -67,9 +68,17 @@ async fn hybrid_search_e1_ranks_first_all_three_returned() {
     driver.save_entity_edges(&[e1, e2, e3]).await.unwrap();
 
     let config = edge_hybrid_search_rrf();
-    let results = edge_search(&driver, &emb, query, &["g1".to_string()], &config)
-        .await
-        .unwrap();
+    let results = edge_search_simple(
+        &driver,
+        &emb,
+        None,
+        query,
+        &["g1".to_string()],
+        &config,
+        &SearchFilters::default(),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(results.len(), 3, "all three edges should be returned");
     assert_eq!(
@@ -110,9 +119,17 @@ async fn hybrid_search_limit_1_returns_only_e1() {
         limit: 1,
         ..edge_hybrid_search_rrf()
     };
-    let results = edge_search(&driver, &emb, query, &["g1".to_string()], &config)
-        .await
-        .unwrap();
+    let results = edge_search_simple(
+        &driver,
+        &emb,
+        None,
+        query,
+        &["g1".to_string()],
+        &config,
+        &SearchFilters::default(),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(results.len(), 1, "limit=1 must return only one edge");
     assert_eq!(results[0].uuid, "e1", "e1 must be the sole result");
@@ -126,12 +143,23 @@ async fn edge_search_no_edge_config_returns_empty() {
 
     let config = SearchConfig {
         edge_config: None,
+        node_config: None,
+        episode_config: None,
+
         limit: 10,
         reranker_min_score: 0.0,
     };
-    let results = edge_search(&driver, &emb, "anything", &[], &config)
-        .await
-        .unwrap();
+    let results = edge_search_simple(
+        &driver,
+        &emb,
+        None,
+        "anything",
+        &[],
+        &config,
+        &SearchFilters::default(),
+    )
+    .await
+    .unwrap();
     assert!(results.is_empty());
 }
 
@@ -153,13 +181,24 @@ async fn edge_search_bm25_only() {
             mmr_lambda: 0.5,
             bfs_max_depth: 3,
         }),
+        node_config: None,
+        episode_config: None,
+
         limit: 10,
         reranker_min_score: 0.0,
     };
 
-    let results = edge_search(&driver, &emb, "alpha", &["g1".to_string()], &config)
-        .await
-        .unwrap();
+    let results = edge_search_simple(
+        &driver,
+        &emb,
+        None,
+        "alpha",
+        &["g1".to_string()],
+        &config,
+        &SearchFilters::default(),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].uuid, "e1");
@@ -187,13 +226,24 @@ async fn edge_search_cosine_only() {
             mmr_lambda: 0.5,
             bfs_max_depth: 3,
         }),
+        node_config: None,
+        episode_config: None,
+
         limit: 10,
         reranker_min_score: 0.0,
     };
 
-    let results = edge_search(&driver, &emb, query, &["g1".to_string()], &config)
-        .await
-        .unwrap();
+    let results = edge_search_simple(
+        &driver,
+        &emb,
+        None,
+        query,
+        &["g1".to_string()],
+        &config,
+        &SearchFilters::default(),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].uuid, "e1");

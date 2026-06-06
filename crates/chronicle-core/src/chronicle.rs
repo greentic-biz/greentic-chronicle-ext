@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 
+use crate::cross_encoder::CrossEncoderClient;
 use crate::driver::GraphDriver;
 use crate::embedder::EmbedderClient;
 use crate::errors::ChronicleError;
@@ -13,7 +14,12 @@ use crate::helpers::SEMAPHORE_LIMIT;
 use crate::llm::LlmClient;
 use crate::pipeline::add_episode::add_episode;
 use crate::pipeline::clients::Clients;
-use crate::search::{SearchConfig, edge_search};
+use crate::search::filters::SearchFilters;
+use crate::search::recipes::{
+    combined_hybrid_search_cross_encoder, edge_hybrid_search_node_distance, edge_hybrid_search_rrf,
+};
+use crate::search::results::SearchResults;
+use crate::search::{SearchConfig, edge_search_simple, search};
 use crate::types::{EntityEdge, EntityNode, EpisodeType, EpisodicEdge, EpisodicNode};
 
 /// Request to ingest a single episode. All fields are explicit — there is no
@@ -46,10 +52,15 @@ pub struct AddEpisodeResults {
     pub edges: Vec<EntityEdge>,
 }
 
-/// Phase-1 Chronicle engine. Bundles the driver / LLM / embedder clients and the
-/// shared concurrency semaphore.
+/// Chronicle engine. Bundles the driver / LLM / embedder clients and the shared
+/// concurrency semaphore, plus an optional cross-encoder reranker.
 pub struct Chronicle {
     clients: Clients,
+    /// Optional cross-encoder reranker. Wired via [`Chronicle::with_cross_encoder`].
+    /// Required for cross-encoder recipes (e.g. the `search_()` default
+    /// `COMBINED_HYBRID_SEARCH_CROSS_ENCODER`); absent → those paths surface
+    /// [`ChronicleError::InvalidInput`].
+    cross_encoder: Option<Arc<dyn CrossEncoderClient>>,
 }
 
 impl Chronicle {
@@ -68,7 +79,17 @@ impl Chronicle {
         };
         Self {
             clients: Clients::new(driver, llm, embedder, permits),
+            cross_encoder: None,
         }
+    }
+
+    /// Attach a cross-encoder reranker, enabling cross-encoder recipes (notably
+    /// the [`Chronicle::search_`] default `COMBINED_HYBRID_SEARCH_CROSS_ENCODER`).
+    /// Builder-style: returns `self` for chaining off [`Chronicle::new`].
+    #[must_use]
+    pub fn with_cross_encoder(mut self, cross_encoder: Arc<dyn CrossEncoderClient>) -> Self {
+        self.cross_encoder = Some(cross_encoder);
+        self
     }
 
     /// Ingest a single episode. See [`crate::pipeline::add_episode::add_episode`].
@@ -94,19 +115,103 @@ impl Chronicle {
             .await?)
     }
 
-    /// Hybrid edge search (BM25 + cosine, RRF-fused) over the given query.
+    /// Edge-only hybrid search with explicit [`SearchConfig`] control.
+    ///
+    /// Returns edges only (drops reranker scores). The wired cross-encoder (if
+    /// any) is forwarded, so cross-encoder edge recipes work once
+    /// [`Chronicle::with_cross_encoder`] has been called. No filters are applied
+    /// — for advanced filtering / multi-scope results use [`Chronicle::search_`].
     pub async fn search(
         &self,
         query: &str,
         group_ids: &[String],
         config: &SearchConfig,
     ) -> Result<Vec<EntityEdge>, ChronicleError> {
-        edge_search(
+        edge_search_simple(
             self.clients.driver.as_ref(),
             self.clients.embedder.as_ref(),
+            self.cross_encoder.as_deref(),
             query,
             group_ids,
             config,
+            &SearchFilters::default(),
+        )
+        .await
+    }
+
+    /// Edge-only hybrid search with upstream `search()` recipe-routing (R13).
+    ///
+    /// Mirrors upstream `graphiti_core/graphiti.py::Graphiti.search`:
+    /// - `center_node_uuid == None` → `EDGE_HYBRID_SEARCH_RRF`;
+    /// - `center_node_uuid == Some(..)` → `EDGE_HYBRID_SEARCH_NODE_DISTANCE`
+    ///   (the center is forwarded to the node-distance reranker);
+    /// - `limit` = `num_results`.
+    ///
+    /// Returns edges only. The base [`Chronicle::search`] is kept for callers that
+    /// want direct [`SearchConfig`] control.
+    pub async fn search_with_center(
+        &self,
+        query: &str,
+        group_ids: &[String],
+        num_results: usize,
+        center_node_uuid: Option<&str>,
+    ) -> Result<Vec<EntityEdge>, ChronicleError> {
+        let mut config = match center_node_uuid {
+            None => edge_hybrid_search_rrf(),
+            Some(_) => edge_hybrid_search_node_distance(),
+        };
+        config.limit = num_results;
+
+        // Forward the center via the full top-level search so the node-distance
+        // reranker receives it (edge_search_simple does not take a center).
+        let results = search(
+            self.clients.driver.as_ref(),
+            self.clients.embedder.as_ref(),
+            self.cross_encoder.as_deref(),
+            query,
+            group_ids,
+            &config,
+            &SearchFilters::default(),
+            center_node_uuid,
+            None,
+        )
+        .await?;
+        Ok(results.edges)
+    }
+
+    /// Advanced multi-scope search (R13 `search_()`).
+    ///
+    /// Mirrors upstream `graphiti_core/graphiti.py::Graphiti.search_`:
+    /// - `config == None` → default `COMBINED_HYBRID_SEARCH_CROSS_ENCODER`
+    ///   (requires a wired cross-encoder — otherwise the cross-encoder scope
+    ///   surfaces [`ChronicleError::InvalidInput`]);
+    /// - `filters == None` → default (empty) [`SearchFilters`];
+    /// - returns the full [`SearchResults`] (edges / nodes / episodes + scores).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn search_(
+        &self,
+        query: &str,
+        config: Option<&SearchConfig>,
+        group_ids: &[String],
+        center_node_uuid: Option<&str>,
+        bfs_origin_node_uuids: Option<&[String]>,
+        filters: Option<&SearchFilters>,
+    ) -> Result<SearchResults, ChronicleError> {
+        let default_config = combined_hybrid_search_cross_encoder();
+        let config = config.unwrap_or(&default_config);
+        let default_filters = SearchFilters::default();
+        let filters = filters.unwrap_or(&default_filters);
+
+        search(
+            self.clients.driver.as_ref(),
+            self.clients.embedder.as_ref(),
+            self.cross_encoder.as_deref(),
+            query,
+            group_ids,
+            config,
+            filters,
+            center_node_uuid,
+            bfs_origin_node_uuids,
         )
         .await
     }

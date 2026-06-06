@@ -391,6 +391,8 @@ async fn collect_candidate_nodes(
             driver
                 .node_similarity_search(
                     &vector,
+                    // Node dedup applies no SearchFilters (upstream-faithful).
+                    &crate::search::filters::SearchFilters::default(),
                     std::slice::from_ref(&group_id),
                     NODE_DEDUP_CANDIDATE_LIMIT,
                     NODE_DEDUP_COSINE_MIN_SCORE,

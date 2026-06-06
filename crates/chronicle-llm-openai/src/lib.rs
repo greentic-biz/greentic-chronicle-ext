@@ -31,6 +31,8 @@
 
 mod embedder;
 mod llm;
+mod reranker;
 
 pub use embedder::{DEFAULT_EMBEDDING_MODEL, OpenAiEmbedder, OpenAiEmbedderConfig};
 pub use llm::{DEFAULT_MODEL, DEFAULT_SMALL_MODEL, OpenAiLlm};
+pub use reranker::{DEFAULT_MODEL as DEFAULT_RERANKER_MODEL, OpenAiReranker};

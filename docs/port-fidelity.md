@@ -65,6 +65,11 @@ Statuses:
 | `crates/chronicle-driver-neo4j/src/lib.rs` | `graphiti_core/driver/neo4j_driver.py` + operations files | adapted | Full `GraphDriver` impl over `neo4rs` incl. Phase-4 `CommunityOps`/`SagaOps`/`BulkSaveOps`. `save_all` runs episodes+nodes+entity-edges+episodic-edges in ONE `start_txn → run all → commit` (rollback on error) — **cross-call atomicity gap (D-5) CLOSED**. |
 | `crates/chronicle-driver-neo4j/src/queries.rs` | `graphiti_core/driver/neo4j/` query builders + `graph_data_operations.py::retrieve_episodes` + `search_utils.py::fulltext_query` | adapted | Cypher query builders. Lucene OR-precedence quirk reproduced bug-for-bug (deviation #6). `validate_group_id` pattern `^[a-zA-Z0-9_-]+$` verbatim from upstream. `MAX_QUERY_LENGTH=128` verbatim. Retrieve episodes tie order is backend-dependent (deviation #12). |
 | `crates/chronicle-driver-neo4j/src/convert.rs` | (Neo4j ↔ domain type conversions, no direct upstream equivalent) | adapted | Bolt value ↔ Rust type bridge; no upstream analog. |
+| `crates/chronicle-driver-surreal/src/lib.rs` (node/episode/community/saga ops) | `graphiti_core/driver/` (SurrealQL is a from-scratch query layer, NOT a Cypher port) | adapted | Full `EntityNodeOps`/`EpisodeOps`/`CommunityOps`/`SagaOps` save/get/get_by_uuids/by_group_ids/delete over embedded SurrealDB (`UPSERT`/`SELECT`/`DELETE`/`RELATE`). Separate tables per node kind (`entity`/`episodic`/`community`/`saga`); uuid is the record id for O(1) lookup. Correctness oracle = behavior parity with FakeDriver/Neo4j (chronicle-testkit + `surreal_e2e` gate), not query-text fidelity. Deviations D-26/D-31/D-32. |
+| `crates/chronicle-driver-surreal/src/lib.rs` (search ops) | `graphiti_core/search/search_utils.py::*` | adapted | `edge`/`node`/`community` fulltext (BM25 `@N@` + `search::score`, one FTS index per field), `*_similarity_search` (HNSW `<\|K,EF\|>` + `vector::distance::knn`, **over-fetch ×3 + min-score post-filter in Rust** — D-26), `node_bfs_search`/`edge_bfs_search` (**iterative multi-query BFS** + depth cap 5 — D-27/D-28), `nodes_connected_to_center` (two-query directed-union adjacency — D-32), `episode_mention_counts`, `get_embeddings_for_{nodes,edges,communities}`, `SearchFilters` WHERE builder (parameterized via `.bind`). |
+| `crates/chronicle-driver-surreal/src/lib.rs` (bulk + maintenance) | `bulk_utils.py` + `community_operations.py` + saga helpers | adapted | `BulkSaveOps::save_all` atomic transaction via the `db.begin()`/`tx.commit()`/`tx.cancel()` handle API (rollback on first statement error — D-5 parity); `get_community_clusters` aggregation; `community_of_member`/`neighbor_communities`; `detach_entities`/`detach_episode` (explicit edge-detach delete, no graph cascade — D-31); saga `get_by_name`/`previous_episode`/`episode_contents`. |
+| `crates/chronicle-driver-surreal/src/schema.rs` | `graphiti_core/driver/` index/constraint DDL | adapted | Idempotent SurrealQL DDL (`DEFINE … IF NOT EXISTS`/`OVERWRITE`): per-node-kind tables + `relates_to`/`mentions`/`has_member`/`has_episode`/`next_episode` RELATION tables; HNSW vector indexes `TYPE F32 DIST COSINE` (D-29); BM25 FTS analyzer + per-field SEARCH indexes; group_id indexes. `build_indices_and_constraints` re-runs DDL idempotently. |
+| `crates/chronicle-driver-surreal/src/convert.rs` | (SurrealDB ↔ domain type conversions, no direct upstream equivalent) | adapted | `chrono::DateTime<Utc>` ↔ `surrealdb::types::Datetime` at the boundary (never bind chrono directly — D-30); `Vec<f32>` ↔ native `array<float>`; `serde_json::Value` attrs ↔ `object`. Row structs with Serialize/Deserialize; uuid↔record-id mapping. Datetime-is-datetime roundtrip guard test. |
 | `crates/chronicle-llm-openai/src/llm.rs` | `graphiti_core/llm_client/openai_generic_client.py`, `openai_base_client.py` | deviation | `DEFAULT_MODEL="gpt-4.1-mini"`, `DEFAULT_SMALL_MODEL="gpt-4.1-nano"`, temperature=0, max_tokens=16384 verbatim. `EmptyResponse` non-retryable (deviation #9). No error-context message appended on retry (deviation #9). RateLimit retried per base tenacity policy (deviation #9). |
 | `crates/chronicle-llm-openai/src/embedder.rs` | `graphiti_core/embedder/openai.py` | adapted | `OpenAiEmbedder`; `DEFAULT_EMBEDDING_MODEL="text-embedding-3-small"`. `EMBEDDING_DIM` is compile-time const (deviation #11). |
 | `crates/chronicle-testkit/src/fake_driver.rs` | (test fixture, no upstream equivalent) | adapted | In-memory `FakeDriver`; deterministic uuid tie-breaks in similarity sorts (deviation #13, test-only). Phase-4 `CommunityOps`/`SagaOps` in-memory; `BulkSaveOps` uses the default sequential `save_all` (no transaction needed — nothing can partially fail in memory). |
@@ -192,6 +197,40 @@ Upstream's `get_community_node_save_query` / saga save queries emit a single-nod
 
 ---
 
+## SurrealDB driver deviations (Phase 3)
+
+These are the locked implementation decisions for `chronicle-driver-surreal` (embedded SurrealDB, `surrealdb` 3.1.3, `kv-rocksdb`/`kv-mem`). All are documented in the Phase-3 spec amendment (`docs/superpowers/specs/2026-06-06-phase-3-embedded-backend-amendment.md` §4). The SurrealDB driver is NOT a query-text port; the correctness oracle is **behavior parity** with the FakeDriver/Neo4j reference, proven by the chronicle-testkit conformance suite + the `surreal_e2e` gate (bi-temporal invalidation + search recall through the real driver).
+
+### D-26: KNN min-score is a post-filter (over-fetch ×3)
+
+SurrealDB's HNSW `<|K,EF|>` operator returns the K nearest neighbours but does not natively filter by a similarity threshold. The trait `*_similarity_search(min_score)` contract requires dropping results below `min_score`. The driver over-fetches `K = limit × 3` candidates, computes `vector::distance::knn()`, then filters `score >= min_score` and truncates to `limit` in Rust. The ×3 padding factor compensates for candidates lost to the post-filter; behaviour is identical to the trait contract (verified by `node_similarity_ranks_exact_match_first_and_cuts_min_score`). Tunable if recall loss is observed on large indexes.
+
+### D-27: BFS is iterative multi-query, not the recursive path idiom
+
+SurrealDB 3.1.3's recursive-path idiom (`origin.{1..N}(->rel->node)`) has limited per-hop edge-predicate expressiveness for chronicle's BFS (which filters edge type + group per hop). Rather than fight the recursive syntax, the driver implements BFS **iteratively**: one adjacency query per hop, accumulating the visited frontier in Rust, applying the edge-type / group filter on each step. Result set is identical to a faithful breadth-first traversal; only the query count scales with depth (bounded by D-28). Verified by `node_bfs_depth_1_vs_3`, `node_bfs_edge_type_filter`, `edge_bfs_returns_only_relates_to`.
+
+### D-28: BFS depth hard cap = 5
+
+Matching the existing clamp pattern and because SurrealDB recursive/iterative traversal performance at depth > 5 is unbenchmarked, the driver clamps the requested BFS depth to a maximum of 5 (sanitized inline integer, never a user-bound parameter). chronicle's search recipes use `MAX_SEARCH_DEPTH = 3`, so the cap is never hit in normal operation; it is a defensive bound on pathological inputs.
+
+### D-29: HNSW `TYPE F32` explicit on every vector index
+
+SurrealDB's default vector index element type is F64. chronicle stores `Vec<f32>` embeddings, so every `DEFINE INDEX … HNSW` carries explicit `TYPE F32 DIST COSINE` to avoid an F64 widening mismatch. The HNSW graph lives in RAM and is rebuilt on `connect()` (idempotent schema DDL); single-process embedded, correct for node-local memory.
+
+### D-30: chrono datetime converted at the boundary (never bound directly)
+
+Binding `chrono::DateTime<Utc>` to a SurrealQL parameter stores it as a **string**, breaking datetime range/comparison queries (surrealdb issues #2753/#2804). The driver converts `chrono::DateTime<Utc>` ↔ `surrealdb::types::Datetime` in `convert.rs` at the persistence boundary — exactly as the Neo4j driver does for BoltDateTime — so stored temporal fields remain queryable as native datetimes. Guarded by a roundtrip test asserting stored values deserialize back as datetimes (not strings).
+
+### D-31: DELETE performs explicit edge-detach, no native graph cascade
+
+SurrealDB's `DELETE` removes a record but does not cascade-delete its incident RELATION edges the way Neo4j's `DETACH DELETE` does. The driver therefore explicitly deletes the incident edges (`relates_to`/`mentions`/`has_member`/`has_episode`/`next_episode`) before/with the node delete (`detach_entities`/`detach_episode`). End-state graph is identical to a Neo4j `DETACH DELETE`; the cascade is just performed in driver code rather than by the engine. Verified by `remove_communities_clears_nodes_and_membership` + the `remove_episode_cascade_surreal` e2e gate.
+
+### D-32: Separate-tables-per-node-kind model + two-query undirected adjacency (no UNION ALL)
+
+Node kinds are modelled as separate SurrealDB tables (`entity`/`episodic`/`community`/`saga`) rather than a single `node` table with a `label` discriminator — cleaner typed queries and per-kind indexes. Consequently, undirected adjacency (`nodes_connected_to_center`) that Cypher expresses with a single `(c)-[]-(n)` pattern is built from **two directed SurrealQL queries** (outgoing `->rel->` and incoming `<-rel<-`) unioned in Rust, because SurrealQL's `UNION ALL` of graph-traversal projections is not used here. Result is the deduplicated 1-hop neighbourhood, identical to the Cypher undirected match.
+
+---
+
 ## Consumer migration: `AddEpisodeRequest` → dw-providers v0.3.0
 
 Phase 4 adds **three new fields** to `AddEpisodeRequest` (all additive, all defaulting to "off"):
@@ -231,7 +270,8 @@ Features acknowledged but out of Phase-1 scope. Listed with target phase.
 | `save_all` transactional driver op | ✅ Done (Phase 4) | Atomicity gap CLOSED — `BulkSaveOps::save_all`, Neo4j single-tx + rollback (D-5) |
 | `semaphore_gather` equivalent fan-out | Phase 3 | Performance improvement for D-4 |
 | `fact_triple` EpisodeType variant | Near-term patch | Read-compat gap (D-7) |
-| Kuzu embedded driver | Phase 3 | `chronicle-driver-kuzu` crate not yet created |
+| ~~Kuzu embedded driver~~ | ❌ Superseded | **Dropped.** Kuzu archived upstream 2025-10-10 (Apple acquisition); see Phase-3 spec amendment. Embedded backend is now SurrealDB. |
+| SurrealDB embedded driver | ✅ Done (Phase 3) | `chronicle-driver-surreal` — full `GraphDriver` supertrait over embedded SurrealDB (`surrealdb` 3.1.3, `kv-rocksdb`/`kv-mem`), feature-gated. Behavior parity with FakeDriver/Neo4j proven by chronicle-testkit + `surreal_e2e` gate. Deviations D-26–D-32. |
 | FalkorDB driver | v1.x | Planned post-v1 |
 | Neptune driver | skipped | Out of scope |
 | Upstream eval/ harness | not applicable | Python pytest-based evaluation suite |

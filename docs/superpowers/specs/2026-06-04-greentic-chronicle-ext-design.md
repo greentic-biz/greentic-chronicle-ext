@@ -23,7 +23,7 @@ Two integration halves:
 |---|---|
 | Integration form | Native Rust provider + standalone library (NOT a WASM design extension — runtime memory needs DB sockets and full tokio) |
 | Repo name | `greentic-chronicle-ext`, org `greentic-biz` (extension/product repo convention) |
-| Graph backends v1 | Neo4j (`neo4rs`) + Kuzu (embedded), feature-gated; FalkorDB in v1.x; Neptune skipped |
+| Graph backends v1 | Neo4j (`neo4rs`) + ~~Kuzu (embedded)~~ **SurrealDB (embedded)**, feature-gated; FalkorDB in v1.x; Neptune skipped — _**SUPERSEDED:** the Kuzu choice below is amended by [`2026-06-06-phase-3-embedded-backend-amendment.md`](2026-06-06-phase-3-embedded-backend-amendment.md). Kuzu was archived upstream (Apple acquisition, 2025-10-10); the embedded backend shipped in Phase 3 is **SurrealDB** (`chronicle-driver-surreal`). All Kuzu references in this spec below are historical._ |
 | Driver abstraction | Operation-level traits (not raw-Cypher passthrough) to prevent Neo4j-ism lock-in |
 | LLM wiring | Own `LlmClient`/`EmbedderClient` traits; v1 ships OpenAI-compatible impl (`async-openai`) AND a bridge adapter over the dw-providers LLM family (bridge lives in greentic-dw-providers) |
 | Scope target | Full parity with graphiti-core, delivered in phases |

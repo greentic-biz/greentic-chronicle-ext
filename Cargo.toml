@@ -5,6 +5,7 @@ members = [
     "crates/chronicle-core",
     "crates/chronicle-testkit",
     "crates/chronicle-driver-neo4j",
+    "crates/chronicle-driver-surreal",
     "crates/chronicle-llm-openai",
 ]
 
@@ -19,6 +20,7 @@ rust-version = "1.95"
 chronicle-core = { path = "crates/chronicle-core" }
 chronicle-testkit = { path = "crates/chronicle-testkit" }
 chronicle-driver-neo4j = { path = "crates/chronicle-driver-neo4j" }
+chronicle-driver-surreal = { path = "crates/chronicle-driver-surreal" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
@@ -32,6 +34,11 @@ tracing = "0.1"
 rand = "0.9"
 futures = "0.3"
 neo4rs = "0.8"
+surrealdb = { version = "3", default-features = false, features = [
+    "kv-rocksdb",
+    "kv-mem",
+] }
+tempfile = "3"
 async-openai = { version = "0.40", default-features = false, features = [
     "rustls",
     "chat-completion",

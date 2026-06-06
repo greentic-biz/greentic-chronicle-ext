@@ -17,8 +17,19 @@ workspace so Greentic digital workers gain long-term, bi-temporal, graph-structu
 |---|---|
 | `chronicle-core` | Domain types, pipeline (extract → dedup → invalidate → persist), search, prompts, traits |
 | `chronicle-driver-neo4j` | `GraphDriver` implementation over Neo4j via `neo4rs` (Bolt) |
+| `chronicle-driver-surreal` | `GraphDriver` implementation over **embedded** SurrealDB (`surrealdb` 3.1.3, `kv-rocksdb`/`kv-mem`) — server-less graph + HNSW vector + BM25 FTS in one engine |
 | `chronicle-llm-openai` | `LlmClient` + `EmbedderClient` over OpenAI-compatible endpoints via `async-openai` |
 | `chronicle-testkit` | `FakeDriver`, `MockLlm`, `MockEmbedder` for deterministic unit tests; driver-conformance integration tests |
+
+### Graph backends
+
+| Backend | Crate | Status | Notes |
+|---|---|---|---|
+| Neo4j (server) | `chronicle-driver-neo4j` | Available | Bolt via `neo4rs`; the reference / conformance-baseline driver |
+| SurrealDB (embedded) | `chronicle-driver-surreal` | Available | Pure-Rust, server-less; feature-gated. Behaviorally interchangeable with Neo4j behind the `GraphDriver` supertrait |
+| FalkorDB | — | v1.x | Planned post-v1 |
+| Neptune | — | Skipped | Out of scope |
+| ~~Kuzu~~ | — | Dropped | Upstream archived 2025-10-10 (Apple acquisition); superseded by SurrealDB embedded — see `docs/port-fidelity.md` |
 
 ---
 
@@ -95,6 +106,34 @@ async fn main() -> anyhow::Result<()> {
 A runnable version of this snippet lives at
 [`crates/chronicle-llm-openai/examples/quickstart.rs`](crates/chronicle-llm-openai/examples/quickstart.rs).
 
+### Embedded backend (SurrealDB)
+
+For a server-less, node-local graph memory, swap the Neo4j driver for the
+embedded SurrealDB driver — nothing else in the pipeline changes (it is
+behaviorally interchangeable behind the `GraphDriver` supertrait):
+
+```rust,ignore
+use std::sync::Arc;
+use chronicle_core::chronicle::Chronicle;
+use chronicle_driver_surreal::SurrealDriver;
+
+// Persistent embedded store backed by RocksDB on disk.
+// `embedding_dim` must match your embedder's output dimension.
+let driver = Arc::new(
+    SurrealDriver::connect_embedded("/var/lib/chronicle/graph.db", 1536).await?,
+);
+
+// (`SurrealDriver::connect_memory(1536)` gives an ephemeral in-memory store,
+// handy for tests.)
+
+let chronicle = Chronicle::new(driver, llm, embedder, 0);
+chronicle.build_indices_and_constraints(false).await?; // idempotent schema DDL
+```
+
+The embedded driver bundles graph traversal, HNSW vector similarity, and BM25
+full-text search in one engine — no external service. It is native-only
+(`kv-rocksdb` links RocksDB's C++); see the build note in the driver crate.
+
 ---
 
 ## Phase Roadmap
@@ -105,10 +144,10 @@ A runnable version of this snippet lives at
 | **Phase 1** | Core loop: add_episode (extract → dedup → bi-temporal invalidation → persist), hybrid RRF search, Neo4j driver, OpenAI LLM/embedder, 185 tests green | Done |
 | **Phase 2** | Full search parity: BFS traversal, MMR / node-distance / episode-mentions / cross-encoder rerankers, `SearchFilters`, multi-scope `search_()` + `search_with_center()`, complete recipe set; D-3 edge-candidate re-ranking closed | Done |
 | **Phase 4** | Communities (detection + summaries + community search scope), sagas (narrative threading + `summarize_saga`), bulk ingest (`add_episode_bulk` cross-episode dedup), `add_triplet`, `remove_episode`, `get_nodes_and_edges_by_episode`, transactional `save_all` (atomicity gap closed) — **full Graphiti-core parity** | Done |
-| **Phase 3** | Entity/edge-type registries + attribute extraction, `extract_summaries_batch`, semaphore fan-out, Kuzu embedded driver (`chronicle-driver-kuzu`) | Planned |
-| **v1.x** | FalkorDB driver | Planned |
+| **Phase 3** | Embedded backend: `chronicle-driver-surreal` — full `GraphDriver` supertrait over embedded SurrealDB (graph + HNSW + BM25), e2e parity gate through the real driver. (Original spec named Kuzu; **superseded by SurrealDB** — Kuzu archived upstream, see spec amendment.) | Done |
+| **v1.x** | Entity/edge-type registries + attribute extraction, `extract_summaries_batch`, semaphore fan-out; FalkorDB driver | Planned |
 
-> **Graphiti-core parity:** with Phase 4 complete, chronicle ports the full Graphiti-core surface (ingest, bi-temporal invalidation, hybrid + community search, communities, sagas, bulk, triplets, maintenance). Remaining items (Phase 3, v1.x) are performance/registry/extra-backend enhancements, not core-semantic gaps.
+> **Graphiti-core parity:** with Phase 4 complete, chronicle ports the full Graphiti-core surface (ingest, bi-temporal invalidation, hybrid + community search, communities, sagas, bulk, triplets, maintenance). Phase 3 adds a server-less embedded backend (SurrealDB). Remaining items (v1.x) are performance/registry/extra-backend enhancements, not core-semantic gaps.
 
 Full fidelity notes and all ported-module statuses: [`docs/port-fidelity.md`](docs/port-fidelity.md).
 

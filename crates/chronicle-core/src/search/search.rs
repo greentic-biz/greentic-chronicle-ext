@@ -4,21 +4,23 @@
 //   - Empty (trimmed) query → default SearchResults immediately (line 117-118).
 //   - Embed the query ONCE iff any scope uses cosine_similarity OR the mmr
 //     reranker; embed text = query.replace('\n', " "); else a zero vector that
-//     the scopes will not consult (line 120-152).
+//     the scopes will not consult (line 120-152). Phase-4: the community scope's
+//     cosine method / mmr reranker now count toward this decision too.
 //   - group_ids `[""]` / empty → treated as None / no filter (line 155). Here
 //     "no filter" maps to an empty slice (the driver fulltext/similarity methods
 //     treat an empty group_ids as "all groups").
-//   - 3 scope searches run in parallel via tokio::join! (upstream
-//     semaphore_gather; community scope deferred to Phase 4).
+//   - 4 scope searches run in parallel via tokio::join! (upstream
+//     semaphore_gather): edge, node, episode, and (Phase-4) community.
 //   - center_node_uuid / bfs_origin_node_uuids forwarded ONLY to edge + node
-//     scopes (the episode scope takes neither).
+//     scopes (the episode + community scopes take neither).
 
 use crate::cross_encoder::CrossEncoderClient;
 use crate::driver::GraphDriver;
 use crate::embedder::EmbedderClient;
 use crate::errors::ChronicleError;
 
-use super::config::{EdgeReranker, NodeReranker, SearchConfig};
+use super::community_search::community_search;
+use super::config::{CommunityReranker, EdgeReranker, NodeReranker, SearchConfig};
 use super::edge_search::edge_search;
 use super::episode_search::episode_search;
 use super::filters::SearchFilters;
@@ -38,16 +40,23 @@ fn needs_query_embedding(config: &SearchConfig) -> bool {
             .contains(&super::config::NodeSearchMethod::CosineSimilarity)
             || c.reranker == NodeReranker::Mmr
     });
+    // Phase-4: the community scope also uses cosine (similarity search) and the
+    // MMR reranker, so it counts toward the embed decision (upstream search.py
+    // lines 132-135).
+    let community_needs = config.community_config.as_ref().is_some_and(|c| {
+        c.search_methods
+            .contains(&super::config::CommunitySearchMethod::CosineSimilarity)
+            || c.reranker == CommunityReranker::Mmr
+    });
     // Episodes never use cosine/MMR (bm25 + rrf/cross_encoder only).
-    edge_needs || node_needs
+    edge_needs || node_needs || community_needs
 }
 
 /// Top-level multi-scope search.
 ///
-/// Upstream: `graphiti_core/search/search.py::search`. Runs the edge, node, and
-/// episode scopes (community deferred to Phase 4) and assembles a
-/// [`SearchResults`]. An empty (trimmed) query short-circuits to the default
-/// (all-empty) results.
+/// Upstream: `graphiti_core/search/search.py::search`. Runs the edge, node,
+/// episode, and (Phase-4) community scopes and assembles a [`SearchResults`]. An
+/// empty (trimmed) query short-circuits to the default (all-empty) results.
 #[allow(clippy::too_many_arguments)]
 pub async fn search(
     driver: &dyn GraphDriver,
@@ -78,9 +87,9 @@ pub async fn search(
         group_ids.to_vec()
     };
 
-    // Run the three scopes in parallel. Each scope short-circuits when its
+    // Run the four scopes in parallel. Each scope short-circuits when its
     // sub-config is None.
-    let (edge_res, node_res, episode_res) = tokio::join!(
+    let (edge_res, node_res, episode_res, community_res) = tokio::join!(
         edge_search(
             driver,
             cross_encoder,
@@ -118,11 +127,22 @@ pub async fn search(
             config.limit,
             config.reranker_min_score,
         ),
+        community_search(
+            driver,
+            cross_encoder,
+            query,
+            &query_vector,
+            &normalized,
+            config.community_config.as_ref(),
+            config.limit,
+            config.reranker_min_score,
+        ),
     );
 
     let (edges, edge_reranker_scores) = edge_res?;
     let (nodes, node_reranker_scores) = node_res?;
     let (episodes, episode_reranker_scores) = episode_res?;
+    let (communities, community_reranker_scores) = community_res?;
 
     Ok(SearchResults {
         edges,
@@ -131,5 +151,7 @@ pub async fn search(
         node_reranker_scores,
         episodes,
         episode_reranker_scores,
+        communities,
+        community_reranker_scores,
     })
 }

@@ -6,19 +6,24 @@
 // Naming convention: snake_case mirrors the upstream UPPER_SNAKE_CASE constant
 // names (e.g. `EDGE_HYBRID_SEARCH_RRF` → `edge_hybrid_search_rrf`).
 //
-// Community recipes (COMMUNITY_HYBRID_SEARCH_*) are NOT ported — community scope is
-// deferred to Phase 4 (upstream community_config; needs CommunityNode storage +
-// CommunitySearchMethod enum) — ledger.
+// Phase-4: community recipes (COMMUNITY_HYBRID_SEARCH_{RRF,MMR,CROSS_ENCODER}) are
+// now ported, and community_config is added to the three COMBINED_* recipes.
 //
 // Note on COMBINED_HYBRID_SEARCH_MMR: upstream sets mmr_lambda=1 (integer) for
-// edge, node, and community scopes. Verified: Python `1` and Python `1.0` are
+// edge, node, AND community scopes (verified search_config_recipes.py lines 56-78:
+// the community_config block carries `mmr_lambda=1` too). Python `1` and `1.0` are
 // identical for a `float` field — upstream intent is pure-relevance MMR (no
 // diversity penalty). Episode scope uses RRF (no MMR option for episodes).
+//
+// Note on COMMUNITY_HYBRID_SEARCH_CROSS_ENCODER: upstream sets `limit=3`
+// explicitly (verified line 217-224). The RRF/MMR community recipes use the
+// default limit. The COMBINED_* recipes' community_config uses the default
+// per-config limit; the top-level SearchConfig limit is unchanged.
 
 use super::config::{
-    DEFAULT_SEARCH_LIMIT, EdgeReranker, EdgeSearchConfig, EdgeSearchMethod, EpisodeReranker,
-    EpisodeSearchConfig, EpisodeSearchMethod, NodeReranker, NodeSearchConfig, NodeSearchMethod,
-    SearchConfig,
+    CommunityReranker, CommunitySearchConfig, CommunitySearchMethod, DEFAULT_SEARCH_LIMIT,
+    EdgeReranker, EdgeSearchConfig, EdgeSearchMethod, EpisodeReranker, EpisodeSearchConfig,
+    EpisodeSearchMethod, NodeReranker, NodeSearchConfig, NodeSearchMethod, SearchConfig,
 };
 
 // ── Combined multi-scope recipes ─────────────────────────────────────────────
@@ -41,6 +46,14 @@ pub fn combined_hybrid_search_rrf() -> SearchConfig {
             search_methods: vec![EpisodeSearchMethod::Bm25],
             reranker: EpisodeReranker::Rrf,
             ..EpisodeSearchConfig::default()
+        }),
+        community_config: Some(CommunitySearchConfig {
+            search_methods: vec![
+                CommunitySearchMethod::Bm25,
+                CommunitySearchMethod::CosineSimilarity,
+            ],
+            reranker: CommunityReranker::Rrf,
+            ..CommunitySearchConfig::default()
         }),
         limit: DEFAULT_SEARCH_LIMIT,
         reranker_min_score: 0.0,
@@ -71,6 +84,17 @@ pub fn combined_hybrid_search_mmr() -> SearchConfig {
             search_methods: vec![EpisodeSearchMethod::Bm25],
             reranker: EpisodeReranker::Rrf,
             ..EpisodeSearchConfig::default()
+        }),
+        community_config: Some(CommunitySearchConfig {
+            search_methods: vec![
+                CommunitySearchMethod::Bm25,
+                CommunitySearchMethod::CosineSimilarity,
+            ],
+            reranker: CommunityReranker::Mmr,
+            // Upstream community_config sets mmr_lambda=1 (verified) — same as
+            // edge/node here. Pure-relevance MMR (no diversity penalty).
+            mmr_lambda: 1.0,
+            ..CommunitySearchConfig::default()
         }),
         limit: DEFAULT_SEARCH_LIMIT,
         reranker_min_score: 0.0,
@@ -105,6 +129,16 @@ pub fn combined_hybrid_search_cross_encoder() -> SearchConfig {
             reranker: EpisodeReranker::CrossEncoder,
             ..EpisodeSearchConfig::default()
         }),
+        community_config: Some(CommunitySearchConfig {
+            // Communities have NO BFS method — upstream uses bm25 + cosine only
+            // (verified search_config_recipes.py lines 104-107).
+            search_methods: vec![
+                CommunitySearchMethod::Bm25,
+                CommunitySearchMethod::CosineSimilarity,
+            ],
+            reranker: CommunityReranker::CrossEncoder,
+            ..CommunitySearchConfig::default()
+        }),
         limit: DEFAULT_SEARCH_LIMIT,
         reranker_min_score: 0.0,
     }
@@ -124,6 +158,7 @@ pub fn edge_hybrid_search_rrf() -> SearchConfig {
         }),
         node_config: None,
         episode_config: None,
+        community_config: None,
 
         limit: DEFAULT_SEARCH_LIMIT,
         reranker_min_score: 0.0,
@@ -141,6 +176,7 @@ pub fn edge_hybrid_search_mmr() -> SearchConfig {
         }),
         node_config: None,
         episode_config: None,
+        community_config: None,
 
         limit: DEFAULT_SEARCH_LIMIT,
         reranker_min_score: 0.0,
@@ -158,6 +194,7 @@ pub fn edge_hybrid_search_node_distance() -> SearchConfig {
         }),
         node_config: None,
         episode_config: None,
+        community_config: None,
 
         limit: DEFAULT_SEARCH_LIMIT,
         reranker_min_score: 0.0,
@@ -175,6 +212,7 @@ pub fn edge_hybrid_search_episode_mentions() -> SearchConfig {
         }),
         node_config: None,
         episode_config: None,
+        community_config: None,
 
         limit: DEFAULT_SEARCH_LIMIT,
         reranker_min_score: 0.0,
@@ -197,6 +235,7 @@ pub fn edge_hybrid_search_cross_encoder() -> SearchConfig {
         }),
         node_config: None,
         episode_config: None,
+        community_config: None,
 
         limit: 10,
         reranker_min_score: 0.0,
@@ -216,6 +255,7 @@ pub fn node_hybrid_search_rrf() -> SearchConfig {
             ..NodeSearchConfig::default()
         }),
         episode_config: None,
+        community_config: None,
 
         limit: DEFAULT_SEARCH_LIMIT,
         reranker_min_score: 0.0,
@@ -233,6 +273,7 @@ pub fn node_hybrid_search_mmr() -> SearchConfig {
             ..NodeSearchConfig::default()
         }),
         episode_config: None,
+        community_config: None,
 
         limit: DEFAULT_SEARCH_LIMIT,
         reranker_min_score: 0.0,
@@ -250,6 +291,7 @@ pub fn node_hybrid_search_node_distance() -> SearchConfig {
             ..NodeSearchConfig::default()
         }),
         episode_config: None,
+        community_config: None,
 
         limit: DEFAULT_SEARCH_LIMIT,
         reranker_min_score: 0.0,
@@ -267,6 +309,7 @@ pub fn node_hybrid_search_episode_mentions() -> SearchConfig {
             ..NodeSearchConfig::default()
         }),
         episode_config: None,
+        community_config: None,
 
         limit: DEFAULT_SEARCH_LIMIT,
         reranker_min_score: 0.0,
@@ -289,8 +332,73 @@ pub fn node_hybrid_search_cross_encoder() -> SearchConfig {
             ..NodeSearchConfig::default()
         }),
         episode_config: None,
+        community_config: None,
 
         limit: 10,
+        reranker_min_score: 0.0,
+    }
+}
+
+// ── Community-only recipes ──────────────────────────────────────────────────
+
+/// Upstream `COMMUNITY_HYBRID_SEARCH_RRF`.
+/// BM25 + CosineSimilarity, RRF reranker, default limit.
+pub fn community_hybrid_search_rrf() -> SearchConfig {
+    SearchConfig {
+        edge_config: None,
+        node_config: None,
+        episode_config: None,
+        community_config: Some(CommunitySearchConfig {
+            search_methods: vec![
+                CommunitySearchMethod::Bm25,
+                CommunitySearchMethod::CosineSimilarity,
+            ],
+            reranker: CommunityReranker::Rrf,
+            ..CommunitySearchConfig::default()
+        }),
+        limit: DEFAULT_SEARCH_LIMIT,
+        reranker_min_score: 0.0,
+    }
+}
+
+/// Upstream `COMMUNITY_HYBRID_SEARCH_MMR`.
+/// BM25 + CosineSimilarity, MMR reranker (default mmr_lambda=0.5 — the COMMUNITY_*
+/// recipe does NOT override lambda; only the COMBINED_* recipe sets it to 1.0).
+pub fn community_hybrid_search_mmr() -> SearchConfig {
+    SearchConfig {
+        edge_config: None,
+        node_config: None,
+        episode_config: None,
+        community_config: Some(CommunitySearchConfig {
+            search_methods: vec![
+                CommunitySearchMethod::Bm25,
+                CommunitySearchMethod::CosineSimilarity,
+            ],
+            reranker: CommunityReranker::Mmr,
+            ..CommunitySearchConfig::default()
+        }),
+        limit: DEFAULT_SEARCH_LIMIT,
+        reranker_min_score: 0.0,
+    }
+}
+
+/// Upstream `COMMUNITY_HYBRID_SEARCH_CROSS_ENCODER`.
+/// BM25 + CosineSimilarity, CrossEncoder reranker. Explicit `limit=3` (matches
+/// the upstream constant which sets `limit=3` — verified).
+pub fn community_hybrid_search_cross_encoder() -> SearchConfig {
+    SearchConfig {
+        edge_config: None,
+        node_config: None,
+        episode_config: None,
+        community_config: Some(CommunitySearchConfig {
+            search_methods: vec![
+                CommunitySearchMethod::Bm25,
+                CommunitySearchMethod::CosineSimilarity,
+            ],
+            reranker: CommunityReranker::CrossEncoder,
+            ..CommunitySearchConfig::default()
+        }),
+        limit: 3,
         reranker_min_score: 0.0,
     }
 }
@@ -299,8 +407,9 @@ pub fn node_hybrid_search_cross_encoder() -> SearchConfig {
 mod tests {
     use super::*;
     use crate::search::config::{
-        DEFAULT_MMR_LAMBDA, DEFAULT_SEARCH_LIMIT, EdgeReranker, EdgeSearchMethod, EpisodeReranker,
-        EpisodeSearchMethod, NodeReranker, NodeSearchMethod,
+        CommunityReranker, CommunitySearchMethod, DEFAULT_MMR_LAMBDA, DEFAULT_SEARCH_LIMIT,
+        EdgeReranker, EdgeSearchMethod, EpisodeReranker, EpisodeSearchMethod, NodeReranker,
+        NodeSearchMethod,
     };
 
     // ── Spot-check 1: combined_cross_encoder has BFS in edge+node + episode bm25 ──
@@ -374,6 +483,16 @@ mod tests {
         // Episodes use RRF, not MMR.
         let epc = cfg.episode_config.expect("episode_config must be Some");
         assert_eq!(epc.reranker, EpisodeReranker::Rrf);
+
+        // Community scope ALSO sets mmr_lambda=1.0 in COMBINED_MMR (verified
+        // upstream search_config_recipes.py).
+        let cc = cfg.community_config.expect("community_config must be Some");
+        assert_eq!(cc.reranker, CommunityReranker::Mmr);
+        assert!(
+            (cc.mmr_lambda - 1.0_f64).abs() < f64::EPSILON,
+            "community mmr_lambda must be 1.0 in COMBINED_MMR, got {}",
+            cc.mmr_lambda
+        );
     }
 
     // ── Spot-check 4: node_distance recipe reranker is NodeDistance ───────────
@@ -430,6 +549,60 @@ mod tests {
         assert!(cfg.edge_config.is_some());
         assert!(cfg.node_config.is_some());
         assert!(cfg.episode_config.is_some());
+        // Phase-4: combined recipes now include the community scope.
+        let cc = cfg.community_config.expect("community_config must be Some");
+        assert_eq!(cc.reranker, CommunityReranker::Rrf);
+        assert!(cc.search_methods.contains(&CommunitySearchMethod::Bm25));
+        assert!(
+            cc.search_methods
+                .contains(&CommunitySearchMethod::CosineSimilarity)
+        );
+    }
+
+    #[test]
+    fn combined_cross_encoder_community_has_no_bfs() {
+        let cfg = combined_hybrid_search_cross_encoder();
+        let cc = cfg.community_config.expect("community_config must be Some");
+        assert_eq!(cc.reranker, CommunityReranker::CrossEncoder);
+        // Communities have no BFS variant — methods are exactly bm25 + cosine.
+        assert_eq!(cc.search_methods.len(), 2);
+        assert!(cc.search_methods.contains(&CommunitySearchMethod::Bm25));
+        assert!(
+            cc.search_methods
+                .contains(&CommunitySearchMethod::CosineSimilarity)
+        );
+    }
+
+    #[test]
+    fn community_rrf_recipe_shape() {
+        let cfg = community_hybrid_search_rrf();
+        assert!(cfg.edge_config.is_none());
+        assert!(cfg.node_config.is_none());
+        assert!(cfg.episode_config.is_none());
+        let cc = cfg.community_config.expect("community_config must be Some");
+        assert_eq!(cc.reranker, CommunityReranker::Rrf);
+        assert_eq!(cfg.limit, DEFAULT_SEARCH_LIMIT);
+    }
+
+    #[test]
+    fn community_mmr_recipe_uses_default_lambda() {
+        // The COMMUNITY_* MMR recipe does NOT override lambda (default 0.5);
+        // only the COMBINED_* recipe sets community lambda=1.0.
+        let cfg = community_hybrid_search_mmr();
+        let cc = cfg.community_config.expect("community_config must be Some");
+        assert_eq!(cc.reranker, CommunityReranker::Mmr);
+        assert!(
+            (cc.mmr_lambda - DEFAULT_MMR_LAMBDA).abs() < f64::EPSILON,
+            "COMMUNITY_MMR uses default lambda 0.5"
+        );
+    }
+
+    #[test]
+    fn community_cross_encoder_recipe_has_explicit_limit_3() {
+        let cfg = community_hybrid_search_cross_encoder();
+        assert_eq!(cfg.limit, 3, "COMMUNITY_CROSS_ENCODER sets limit=3");
+        let cc = cfg.community_config.expect("community_config must be Some");
+        assert_eq!(cc.reranker, CommunityReranker::CrossEncoder);
     }
 
     #[test]

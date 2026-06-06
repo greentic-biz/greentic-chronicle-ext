@@ -326,20 +326,30 @@ impl EpisodicEdgeOps for Neo4jDriver {
     }
 }
 
+impl Neo4jDriver {
+    /// Bind a `[(name, BoltType)]` param list (produced by the filter-fragment
+    /// builders in `queries.rs`) onto a [`Query`]. Centralised so every search
+    /// method threads filter params identically.
+    fn bind_filter_params(mut q: Query, params: Vec<(String, neo4rs::BoltType)>) -> Query {
+        for (name, value) in params {
+            q = q.param(&name, value);
+        }
+        q
+    }
+}
+
 #[async_trait]
 impl SearchOps for Neo4jDriver {
-    // NOTE (Phase-2 Task 6): the `filters: &SearchFilters` param is threaded
-    // through the four existing search methods for signature parity, but the
-    // full SearchFilters WHERE construction (edge_types / edge_uuids / node_labels
-    // / date OR-of-ANDs groups) lands in Task 6 against the query templates in
-    // `queries.rs`. To avoid a partial-filter footgun (silently applying only
-    // some predicates while a caller believes all are honored), the param content
-    // is intentionally IGNORED here until Task 6 wires every predicate. The
-    // FakeDriver already honors the full SearchFilters surface for unit tests.
+    // Phase-2 Task 6: the four existing search methods now apply the FULL
+    // SearchFilters surface (edge_types / edge_uuids / node_labels / date
+    // OR-of-ANDs groups) via the WHERE-fragment builders in `queries.rs`. Fulltext
+    // appends fragments to the post-YIELD WHERE; similarity appends them into the
+    // WHERE alongside the group/score conditions. Node scopes apply node_labels
+    // only (matching upstream `node_search_filter_query_constructor`).
     async fn edge_fulltext_search(
         &self,
         query_text: &str,
-        _filters: &SearchFilters,
+        filters: &SearchFilters,
         group_ids: &[String],
         limit: usize,
     ) -> Result<Vec<EntityEdge>, DriverError> {
@@ -347,10 +357,20 @@ impl SearchOps for Neo4jDriver {
         let Some(fuzzy) = build_fulltext_query(query_text, group_ids)? else {
             return Ok(Vec::new());
         };
-        let q = query(queries::EDGE_FULLTEXT_SEARCH)
+        let (fragments, filter_params) = queries::edge_filter_fragments(filters)?;
+        // Base post-YIELD WHERE is `e.group_id IN $group_ids`; append filter
+        // fragments with AND so they compose with the group scope.
+        let mut where_extra = String::new();
+        for frag in &fragments {
+            where_extra.push_str("\n    AND ");
+            where_extra.push_str(frag);
+        }
+        let cypher = queries::EDGE_FULLTEXT_SEARCH.replace("{filters}", &where_extra);
+        let q = query(&cypher)
             .param("query", fuzzy)
             .param("group_ids", group_ids.to_vec())
             .param("limit", limit as i64);
+        let q = Self::bind_filter_params(q, filter_params);
         let rows = self.fetch_rows(q, "edge_fulltext_search").await?;
         rows.iter().map(convert::entity_edge_from_row).collect()
     }
@@ -358,19 +378,28 @@ impl SearchOps for Neo4jDriver {
     async fn edge_similarity_search(
         &self,
         search_vector: &[f32],
-        _filters: &SearchFilters,
+        filters: &SearchFilters,
         group_ids: &[String],
         limit: usize,
         min_score: f32,
     ) -> Result<Vec<EntityEdge>, DriverError> {
-        // filters applied fully in Task 6 (see SearchOps impl note above).
         debug!(limit, min_score, "neo4j edge_similarity_search");
+        let (fragments, filter_params) = queries::edge_filter_fragments(filters)?;
+        // The first WHERE gates on group_id + non-null embedding; append the
+        // filter fragments there so they prune candidates BEFORE the cosine call.
+        let mut where_extra = String::new();
+        for frag in &fragments {
+            where_extra.push_str("\n    AND ");
+            where_extra.push_str(frag);
+        }
+        let cypher = queries::EDGE_SIMILARITY_SEARCH.replace("{filters}", &where_extra);
         let vector: Vec<f64> = search_vector.iter().map(|f| *f as f64).collect();
-        let q = query(queries::EDGE_SIMILARITY_SEARCH)
+        let q = query(&cypher)
             .param("search_vector", vector)
             .param("group_ids", group_ids.to_vec())
             .param("limit", limit as i64)
             .param("min_score", min_score as f64);
+        let q = Self::bind_filter_params(q, filter_params);
         let rows = self.fetch_rows(q, "edge_similarity_search").await?;
         rows.iter().map(convert::entity_edge_from_row).collect()
     }
@@ -378,19 +407,26 @@ impl SearchOps for Neo4jDriver {
     async fn node_fulltext_search(
         &self,
         query_text: &str,
-        _filters: &SearchFilters,
+        filters: &SearchFilters,
         group_ids: &[String],
         limit: usize,
     ) -> Result<Vec<EntityNode>, DriverError> {
-        // filters applied fully in Task 6 (see SearchOps impl note above).
         debug!(query_text, limit, "neo4j node_fulltext_search");
         let Some(fuzzy) = build_fulltext_query(query_text, group_ids)? else {
             return Ok(Vec::new());
         };
-        let q = query(queries::NODE_FULLTEXT_SEARCH)
+        let (fragments, filter_params) = queries::node_filter_fragments(filters)?;
+        let mut where_extra = String::new();
+        for frag in &fragments {
+            where_extra.push_str("\n    AND ");
+            where_extra.push_str(frag);
+        }
+        let cypher = queries::NODE_FULLTEXT_SEARCH.replace("{filters}", &where_extra);
+        let q = query(&cypher)
             .param("query", fuzzy)
             .param("group_ids", group_ids.to_vec())
             .param("limit", limit as i64);
+        let q = Self::bind_filter_params(q, filter_params);
         let rows = self.fetch_rows(q, "node_fulltext_search").await?;
         rows.iter().map(convert::entity_node_from_row).collect()
     }
@@ -398,113 +434,209 @@ impl SearchOps for Neo4jDriver {
     async fn node_similarity_search(
         &self,
         search_vector: &[f32],
-        _filters: &SearchFilters,
+        filters: &SearchFilters,
         group_ids: &[String],
         limit: usize,
         min_score: f32,
     ) -> Result<Vec<EntityNode>, DriverError> {
-        // filters applied fully in Task 6 (see SearchOps impl note above).
         debug!(limit, min_score, "neo4j node_similarity_search");
+        let (fragments, filter_params) = queries::node_filter_fragments(filters)?;
+        let mut where_extra = String::new();
+        for frag in &fragments {
+            where_extra.push_str("\n    AND ");
+            where_extra.push_str(frag);
+        }
+        let cypher = queries::NODE_SIMILARITY_SEARCH.replace("{filters}", &where_extra);
         let vector: Vec<f64> = search_vector.iter().map(|f| *f as f64).collect();
-        let q = query(queries::NODE_SIMILARITY_SEARCH)
+        let q = query(&cypher)
             .param("search_vector", vector)
             .param("group_ids", group_ids.to_vec())
             .param("limit", limit as i64)
             .param("min_score", min_score as f64);
+        let q = Self::bind_filter_params(q, filter_params);
         let rows = self.fetch_rows(q, "node_similarity_search").await?;
         rows.iter().map(convert::entity_node_from_row).collect()
     }
 
-    // ── Phase-2 search primitives (functional Cypher lands in Task 6) ─────────
-    //
-    // These return an explicit `DriverError::Query` rather than a silent empty
-    // result so that any caller reaching them before Task 6 fails loudly instead
-    // of receiving wrong (empty) data. Their integration tests are env-gated
-    // (docker) and deferred to Task 6 alongside the query templates. The
-    // FakeDriver provides functional in-memory implementations for unit tests.
+    // ── Phase-2 search primitives (R5/R7/R8/R9) ──────────────────────────────
 
     async fn node_bfs_search(
         &self,
-        _origins: &[String],
-        _filters: &SearchFilters,
-        _max_depth: usize,
-        _group_ids: &[String],
-        _limit: usize,
+        origins: &[String],
+        filters: &SearchFilters,
+        max_depth: usize,
+        group_ids: &[String],
+        limit: usize,
     ) -> Result<Vec<EntityNode>, DriverError> {
-        // TODO(Task 6): BFS Cypher per plan R9 (var-length depth inlined, not a
-        // $param; SearchFilters WHERE fragments).
-        Err(DriverError::Query(
-            "phase-2 task-6 pending: node_bfs_search".into(),
-        ))
+        debug!(
+            origins = origins.len(),
+            max_depth, limit, "neo4j node_bfs_search"
+        );
+        // Upstream early-return: no origins or depth < 1 → empty.
+        if origins.is_empty() || max_depth < 1 {
+            return Ok(Vec::new());
+        }
+        let (fragments, filter_params) = queries::node_filter_fragments(filters)?;
+        let with_group_ids = !group_ids.is_empty();
+        let cypher = queries::node_bfs_query(max_depth, &fragments, with_group_ids);
+        let mut q = query(&cypher)
+            .param("bfs_origin_node_uuids", origins.to_vec())
+            .param("limit", limit as i64);
+        if with_group_ids {
+            q = q.param("group_ids", group_ids.to_vec());
+        }
+        let q = Self::bind_filter_params(q, filter_params);
+        let rows = self.fetch_rows(q, "node_bfs_search").await?;
+        rows.iter().map(convert::entity_node_from_row).collect()
     }
 
     async fn edge_bfs_search(
         &self,
-        _origins: &[String],
-        _max_depth: usize,
-        _filters: &SearchFilters,
-        _group_ids: &[String],
-        _limit: usize,
+        origins: &[String],
+        max_depth: usize,
+        filters: &SearchFilters,
+        group_ids: &[String],
+        limit: usize,
     ) -> Result<Vec<EntityEdge>, DriverError> {
-        // TODO(Task 6): path-expansion BFS Cypher per plan R9.
-        Err(DriverError::Query(
-            "phase-2 task-6 pending: edge_bfs_search".into(),
-        ))
+        debug!(
+            origins = origins.len(),
+            max_depth, limit, "neo4j edge_bfs_search"
+        );
+        // Upstream early-return: no origins → empty.
+        if origins.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (mut fragments, mut filter_params) = queries::edge_filter_fragments(filters)?;
+        // Upstream appends `e.group_id IN $group_ids` to the filter list when
+        // group_ids is provided (NOT a base WHERE — edge BFS has no base WHERE).
+        if !group_ids.is_empty() {
+            fragments.push("e.group_id IN $group_ids".to_string());
+        }
+        let cypher = queries::edge_bfs_query(max_depth, &fragments);
+        let mut q = query(&cypher)
+            .param("bfs_origin_node_uuids", origins.to_vec())
+            .param("limit", limit as i64);
+        if !group_ids.is_empty() {
+            q = q.param("group_ids", group_ids.to_vec());
+        }
+        // bind_filter_params consumes the vec; bind here.
+        for (name, value) in std::mem::take(&mut filter_params) {
+            q = q.param(&name, value);
+        }
+        let rows = self.fetch_rows(q, "edge_bfs_search").await?;
+        rows.iter().map(convert::entity_edge_from_row).collect()
     }
 
     async fn episode_fulltext_search(
         &self,
-        _query: &str,
-        _group_ids: &[String],
-        _limit: usize,
+        query_text: &str,
+        group_ids: &[String],
+        limit: usize,
     ) -> Result<Vec<EpisodicNode>, DriverError> {
-        // TODO(Task 6): episode_content fulltext index query per plan R5.
-        Err(DriverError::Query(
-            "phase-2 task-6 pending: episode_fulltext_search".into(),
-        ))
+        debug!(query_text, limit, "neo4j episode_fulltext_search");
+        let Some(fuzzy) = build_fulltext_query(query_text, group_ids)? else {
+            return Ok(Vec::new());
+        };
+        // Assemble head + optional group filter + tail, mirroring upstream's
+        // `group_filter_query` concatenation.
+        let mut cypher = String::from(queries::EPISODE_FULLTEXT_SEARCH_HEAD);
+        if !group_ids.is_empty() {
+            cypher.push_str(queries::EPISODE_FULLTEXT_GROUP_FILTER);
+        }
+        cypher.push_str(queries::EPISODE_FULLTEXT_SEARCH_TAIL);
+        let mut q = query(&cypher)
+            .param("query", fuzzy)
+            .param("limit", limit as i64);
+        if !group_ids.is_empty() {
+            q = q.param("group_ids", group_ids.to_vec());
+        }
+        let rows = self.fetch_rows(q, "episode_fulltext_search").await?;
+        rows.iter().map(convert::episodic_node_from_row).collect()
     }
 
     async fn get_embeddings_for_nodes(
         &self,
-        _uuids: &[String],
+        uuids: &[String],
     ) -> Result<HashMap<String, Vec<f32>>, DriverError> {
-        // TODO(Task 6): RETURN uuid + name_embedding WHERE uuid IN $uuids
-        // AND name_embedding IS NOT NULL.
-        Err(DriverError::Query(
-            "phase-2 task-6 pending: get_embeddings_for_nodes".into(),
-        ))
+        debug!(count = uuids.len(), "neo4j get_embeddings_for_nodes");
+        if uuids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let q = query(queries::GET_NODE_EMBEDDINGS).param("uuids", uuids.to_vec());
+        let rows = self.fetch_rows(q, "get_embeddings_for_nodes").await?;
+        let mut out = HashMap::with_capacity(rows.len());
+        for row in &rows {
+            if let Some((uuid, emb)) = convert::embedding_row(row)? {
+                out.insert(uuid, emb);
+            }
+        }
+        Ok(out)
     }
 
     async fn get_embeddings_for_edges(
         &self,
-        _uuids: &[String],
+        uuids: &[String],
     ) -> Result<HashMap<String, Vec<f32>>, DriverError> {
-        // TODO(Task 6): RETURN uuid + fact_embedding WHERE uuid IN $uuids
-        // AND fact_embedding IS NOT NULL.
-        Err(DriverError::Query(
-            "phase-2 task-6 pending: get_embeddings_for_edges".into(),
-        ))
+        debug!(count = uuids.len(), "neo4j get_embeddings_for_edges");
+        if uuids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let q = query(queries::GET_EDGE_EMBEDDINGS).param("uuids", uuids.to_vec());
+        let rows = self.fetch_rows(q, "get_embeddings_for_edges").await?;
+        let mut out = HashMap::with_capacity(rows.len());
+        for row in &rows {
+            if let Some((uuid, emb)) = convert::embedding_row(row)? {
+                out.insert(uuid, emb);
+            }
+        }
+        Ok(out)
     }
 
     async fn nodes_connected_to_center(
         &self,
-        _node_uuids: &[String],
-        _center_uuid: &str,
+        node_uuids: &[String],
+        center_uuid: &str,
     ) -> Result<Vec<String>, DriverError> {
-        // TODO(Task 6): undirected 1-hop RELATES_TO adjacency Cypher per plan R7.
-        Err(DriverError::Query(
-            "phase-2 task-6 pending: nodes_connected_to_center".into(),
-        ))
+        debug!(count = node_uuids.len(), "neo4j nodes_connected_to_center");
+        if node_uuids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let q = query(queries::NODES_CONNECTED_TO_CENTER)
+            .param("node_uuids", node_uuids.to_vec())
+            .param("center_uuid", center_uuid);
+        let rows = self.fetch_rows(q, "nodes_connected_to_center").await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let uuid: String = row
+                .get("uuid")
+                .map_err(|e| DriverError::Decode(format!("adjacency row missing uuid: {e}")))?;
+            out.push(uuid);
+        }
+        Ok(out)
     }
 
     async fn episode_mention_counts(
         &self,
-        _node_uuids: &[String],
+        node_uuids: &[String],
     ) -> Result<HashMap<String, u64>, DriverError> {
-        // TODO(Task 6): MENTIONS in-degree count Cypher per plan R8.
-        Err(DriverError::Query(
-            "phase-2 task-6 pending: episode_mention_counts".into(),
-        ))
+        debug!(count = node_uuids.len(), "neo4j episode_mention_counts");
+        if node_uuids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let q = query(queries::EPISODE_MENTION_COUNTS).param("node_uuids", node_uuids.to_vec());
+        let rows = self.fetch_rows(q, "episode_mention_counts").await?;
+        let mut out = HashMap::with_capacity(rows.len());
+        for row in &rows {
+            let uuid: String = row
+                .get("uuid")
+                .map_err(|e| DriverError::Decode(format!("mention-count row missing uuid: {e}")))?;
+            let score: i64 = row.get("score").map_err(|e| {
+                DriverError::Decode(format!("mention-count row missing score: {e}"))
+            })?;
+            // count(*) is non-negative; clamp defensively for the u64 cast.
+            out.insert(uuid, score.max(0) as u64);
+        }
+        Ok(out)
     }
 }
 

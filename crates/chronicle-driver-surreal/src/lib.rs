@@ -11,14 +11,14 @@
 //!
 //! ## Phasing
 //!
-//! This crate lands in three implementation tasks. **Task 1** (this file as
-//! shipped here) covers: connect (embedded + in-memory), idempotent schema DDL,
-//! node/edge persistence (save + get + get-by-uuids + by-group-ids), episode
-//! retrieval, community/saga save+get, and `SchemaOps`. Search, BFS, embeddings
-//! loaders, adjacency/mention rerank support, cluster projection, transactional
-//! bulk save, and the deletion/maintenance ops land in **Tasks 2 and 3**; until
-//! then they return a loud [`DriverError::Query`] (never a silent empty success)
-//! so an accidental caller fails fast.
+//! This crate landed across three implementation tasks. **Task 1**: connect
+//! (embedded + in-memory), idempotent schema DDL, node/edge persistence, episode
+//! retrieval, community/saga save+get, and `SchemaOps`. **Task 2**: the full
+//! `SearchOps` surface (vector/fulltext/BFS, embedding loaders, adjacency +
+//! mention rerank support, `SearchFilters`). **Task 3**: transactional bulk save
+//! (`BulkSaveOps::save_all`), the deletion/maintenance ops, the community-cluster
+//! projection + membership queries, and the saga-threading queries. Every trait
+//! method is now implemented (no remaining loud-`pending` stubs).
 //!
 //! ## Datetime boundary (locked decision #1)
 //!
@@ -42,7 +42,8 @@ use tracing::debug;
 
 use chronicle_core::driver::{
     BulkSaveOps, CommunityOps, DriverError, EntityEdgeOps, EntityNodeOps, EpisodeOps,
-    EpisodicEdgeOps, GraphDriver, GroupClusterProjection, SagaOps, SchemaOps, SearchOps,
+    EpisodicEdgeOps, GraphDriver, GroupClusterProjection, Neighbor, NodeNeighbors, SagaOps,
+    SchemaOps, SearchOps,
 };
 use chronicle_core::search::filters::SearchFilters;
 use chronicle_core::types::{
@@ -52,10 +53,10 @@ use chronicle_core::types::{
 
 use convert::{
     CommunityNodeRow, EmbeddingRow, EntityEdgeRow, EntityNodeRow, EpisodicNodeRow, MentionCountRow,
-    SagaNodeRow, ScoredCommunityNodeRow, ScoredEntityEdgeRow, ScoredEntityNodeRow,
-    community_node_from_row, community_node_to_row, entity_edge_from_row, entity_edge_to_row,
-    entity_node_from_row, entity_node_to_row, episode_from_row, episode_to_row, record_id,
-    saga_node_from_row, saga_node_to_row,
+    SagaEpisodeContentRow, SagaNodeRow, SagaPreviousEpisodeRow, ScoredCommunityNodeRow,
+    ScoredEntityEdgeRow, ScoredEntityNodeRow, community_node_from_row, community_node_to_row,
+    entity_edge_from_row, entity_edge_to_row, entity_node_from_row, entity_node_to_row,
+    episode_from_row, episode_to_row, record_id, saga_node_from_row, saga_node_to_row,
 };
 use filters::{FilterFragments, edge_filter_fragments, node_filter_fragments};
 
@@ -85,12 +86,6 @@ fn overfetch_k(limit: usize) -> usize {
 /// The clamp is the injection guard: a usize through `1..=MAX` renders as digits.
 fn clamp_bfs_depth(depth: usize) -> usize {
     depth.clamp(1, MAX_BFS_DEPTH)
-}
-
-/// Loud placeholder for ops deferred to Phase-3 Task 2 / Task 3. Returns an
-/// error (never a silent empty success) so a premature caller fails fast.
-fn pending(method: &str) -> DriverError {
-    DriverError::Query(format!("phase-3 task-2/3 pending: {method}"))
 }
 
 /// Embedded SurrealDB-backed `GraphDriver`.
@@ -326,15 +321,49 @@ impl EntityNodeOps for SurrealDriver {
 
     async fn get_mentioned_nodes(
         &self,
-        _episode_uuids: &[String],
+        episode_uuids: &[String],
     ) -> Result<Vec<EntityNode>, DriverError> {
-        // Graph traversal over `mentions` — Task 3.
-        Err(pending("get_mentioned_nodes"))
+        debug!(count = episode_uuids.len(), "surreal get_mentioned_nodes");
+        if episode_uuids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Entities reachable via `mentions` edges from the given episodes
+        // (mirrors Neo4j `MATCH (e:Episodic)-[:MENTIONS]->(n:Entity) WHERE
+        // e.uuid IN $uuids RETURN DISTINCT n`). `id IN (...)` deduplicates by
+        // record id, so each mentioned entity appears once.
+        let episode_ids: Vec<surrealdb::types::Value> = episode_uuids
+            .iter()
+            .map(|u| record_id("episodic", u).into_value())
+            .collect();
+        let sql = "SELECT * FROM entity \
+                   WHERE id IN (SELECT VALUE out FROM mentions WHERE in IN $episodes)"
+            .to_string();
+        let params = vec![("episodes".to_string(), episode_ids.into_value())];
+        let rows: Vec<EntityNodeRow> = self.fetch_dyn(sql, params, "get_mentioned_nodes").await?;
+        Ok(rows.into_iter().map(entity_node_from_row).collect())
     }
 
-    async fn delete_entity_nodes_by_uuids(&self, _uuids: &[String]) -> Result<(), DriverError> {
-        // Cascade delete (DETACH-equivalent) — Task 3.
-        Err(pending("delete_entity_nodes_by_uuids"))
+    async fn delete_entity_nodes_by_uuids(&self, uuids: &[String]) -> Result<(), DriverError> {
+        debug!(count = uuids.len(), "surreal delete_entity_nodes_by_uuids");
+        if uuids.is_empty() {
+            return Ok(());
+        }
+        // SurrealDB DELETE does NOT auto-remove incident graph (RELATE) edges —
+        // unlike Neo4j `DETACH DELETE`. To match the cascade contract we
+        // explicitly delete every relation row touching these entities (as an
+        // `in` OR `out` endpoint) across the relation tables that can reach an
+        // entity (`relates_to`, `mentions`, `has_member`), then the nodes.
+        let ids: Vec<surrealdb::types::Value> = uuids
+            .iter()
+            .map(|u| record_id("entity", u).into_value())
+            .collect();
+        self.detach_entities(&ids).await?;
+        self.run_write(
+            "DELETE entity WHERE id IN $ids",
+            |q| q.bind(("ids", ids)),
+            "delete_entity_nodes_by_uuids",
+        )
+        .await
     }
 }
 
@@ -424,8 +453,19 @@ impl EntityEdgeOps for SurrealDriver {
             .collect())
     }
 
-    async fn delete_entity_edges_by_uuids(&self, _uuids: &[String]) -> Result<(), DriverError> {
-        Err(pending("delete_entity_edges_by_uuids"))
+    async fn delete_entity_edges_by_uuids(&self, uuids: &[String]) -> Result<(), DriverError> {
+        debug!(count = uuids.len(), "surreal delete_entity_edges_by_uuids");
+        if uuids.is_empty() {
+            return Ok(());
+        }
+        // Delete the `relates_to` relation rows by uuid (mirrors Neo4j
+        // `MATCH ()-[e:RELATES_TO]->() WHERE e.uuid IN $uuids DELETE e`).
+        self.run_write(
+            "DELETE relates_to WHERE uuid IN $uuids",
+            |q| q.bind(("uuids", uuids.to_vec())),
+            "delete_entity_edges_by_uuids",
+        )
+        .await
     }
 }
 
@@ -535,8 +575,19 @@ impl EpisodeOps for SurrealDriver {
         Ok(episodes)
     }
 
-    async fn delete_episode(&self, _uuid: &str) -> Result<(), DriverError> {
-        Err(pending("delete_episode"))
+    async fn delete_episode(&self, uuid: &str) -> Result<(), DriverError> {
+        debug!(uuid, "surreal delete_episode");
+        // DETACH-equivalent: remove the episode's incident relation rows
+        // (`mentions` out of it, `has_episode` into it, `next_episode` either
+        // direction) then the node itself (mirrors Neo4j `DETACH DELETE`).
+        let id = record_id("episodic", uuid).into_value();
+        self.detach_episode(&id).await?;
+        self.run_write(
+            "DELETE episodic WHERE id = $id",
+            |q| q.bind(("id", id)),
+            "delete_episode",
+        )
+        .await
     }
 }
 
@@ -571,9 +622,160 @@ impl EpisodicEdgeOps for SurrealDriver {
 
 #[async_trait]
 impl BulkSaveOps for SurrealDriver {
-    // Task 3 supplies a single-transaction override. Until then the default
-    // sequential `save_all` (four independent saves) is inherited; it is
-    // correct, just not atomic across the four writes.
+    /// Atomic group-save: episodes, entity nodes, entity edges and episodic
+    /// edges in a SINGLE SurrealDB transaction (closes the carried-forward
+    /// atomicity gap, mirroring the Neo4j `run_all_in_txn` override).
+    ///
+    /// We open a real transaction handle via `db.begin()` (3.1.3 tags every
+    /// subsequent statement with the same txn id — preferable to splicing raw
+    /// `BEGIN`/`COMMIT` text) and replay each non-empty collection's standalone
+    /// save statements inside it. After every statement we `.check()` the
+    /// response; the FIRST statement error short-circuits to a `tx.cancel()`
+    /// (rollback) leaving the graph unchanged, then returns the error. An
+    /// all-success run ends with `tx.commit()`. An entirely-empty batch is a
+    /// no-op (no transaction opened).
+    async fn save_all(
+        &self,
+        episodes: &[EpisodicNode],
+        episodic_edges: &[EpisodicEdge],
+        entity_nodes: &[EntityNode],
+        entity_edges: &[EntityEdge],
+    ) -> Result<(), DriverError> {
+        debug!(
+            episodes = episodes.len(),
+            episodic_edges = episodic_edges.len(),
+            entity_nodes = entity_nodes.len(),
+            entity_edges = entity_edges.len(),
+            "surreal save_all (transactional)"
+        );
+        if episodes.is_empty()
+            && episodic_edges.is_empty()
+            && entity_nodes.is_empty()
+            && entity_edges.is_empty()
+        {
+            return Ok(());
+        }
+
+        // Pre-build every statement (sql + bound params) outside the txn so a
+        // build error never leaves an open transaction.
+        let mut stmts: Vec<TxnStmt> = Vec::new();
+        for ep in episodes {
+            stmts.push(TxnStmt::upsert(
+                "episodic",
+                &ep.uuid,
+                episode_to_row(ep).into_value(),
+            ));
+        }
+        for n in entity_nodes {
+            stmts.push(TxnStmt::upsert(
+                "entity",
+                &n.uuid,
+                entity_node_to_row(n).into_value(),
+            ));
+        }
+        for e in entity_edges {
+            stmts.push(TxnStmt::relate(
+                record_id("entity", &e.source_node_uuid),
+                record_id("relates_to", &e.uuid),
+                record_id("entity", &e.target_node_uuid),
+                entity_edge_to_row(e).into_value(),
+            ));
+        }
+        for e in episodic_edges {
+            stmts.push(TxnStmt::relate(
+                record_id("episodic", &e.source_node_uuid),
+                record_id("mentions", &e.uuid),
+                record_id("entity", &e.target_node_uuid),
+                convert::episodic_edge_to_row(e).into_value(),
+            ));
+        }
+
+        self.run_all_in_txn(stmts, "save_all").await
+    }
+}
+
+/// One pre-built write statement for a transactional batch: an owned SQL string
+/// plus its owned `(name, value)` params. Built outside the transaction so a
+/// conversion failure can never strand an open txn.
+struct TxnStmt {
+    sql: &'static str,
+    params: Vec<(String, surrealdb::types::Value)>,
+}
+
+impl TxnStmt {
+    /// `UPSERT $id CONTENT $row` for a node table keyed by uuid.
+    fn upsert(table: &str, uuid: &str, row: surrealdb::types::Value) -> Self {
+        TxnStmt {
+            sql: "UPSERT $id CONTENT $row",
+            params: vec![
+                ("id".to_string(), record_id(table, uuid).into_value()),
+                ("row".to_string(), row),
+            ],
+        }
+    }
+
+    /// `RELATE $src->$rel->$dst CONTENT $row` for a typed relation edge.
+    fn relate(
+        src: surrealdb::types::RecordId,
+        rel: surrealdb::types::RecordId,
+        dst: surrealdb::types::RecordId,
+        row: surrealdb::types::Value,
+    ) -> Self {
+        TxnStmt {
+            sql: "RELATE $src->$rel->$dst CONTENT $row",
+            params: vec![
+                ("src".to_string(), src.into_value()),
+                ("rel".to_string(), rel.into_value()),
+                ("dst".to_string(), dst.into_value()),
+                ("row".to_string(), row),
+            ],
+        }
+    }
+}
+
+impl SurrealDriver {
+    /// Run several write statements inside ONE transaction, committing only
+    /// after every statement applied cleanly. A statement error rolls the whole
+    /// batch back (`tx.cancel()`) and returns the error, leaving the graph
+    /// unchanged — the atomic group-save primitive behind `save_all`.
+    ///
+    /// `db.begin()` consumes a `Surreal` handle by value; the driver holds it
+    /// behind `&self`, so we clone the (Arc-backed) handle. `commit`/`cancel`
+    /// consume the transaction and yield a client back, which we discard.
+    async fn run_all_in_txn(&self, stmts: Vec<TxnStmt>, ctx: &str) -> Result<(), DriverError> {
+        if stmts.is_empty() {
+            return Ok(());
+        }
+        let tx = self
+            .db
+            .clone()
+            .begin()
+            .await
+            .map_err(|e| DriverError::Query(format!("{ctx}: begin txn: {e}")))?;
+
+        for stmt in stmts {
+            let mut q = tx.query(stmt.sql);
+            for (name, value) in stmt.params {
+                q = q.bind((name, value));
+            }
+            // A failed `await` (transport) or a failed `.check()` (statement
+            // error) both trigger a rollback. We must not early-`?` before the
+            // cancel, or the txn would be left dangling.
+            let outcome = match q.await {
+                Ok(res) => res.check().map(|_| ()),
+                Err(e) => Err(e),
+            };
+            if let Err(e) = outcome {
+                let _ = tx.cancel().await;
+                return Err(DriverError::Query(format!("{ctx}: statement failed: {e}")));
+            }
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| DriverError::Query(format!("{ctx}: commit: {e}")))?;
+        Ok(())
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1205,32 +1407,222 @@ impl CommunityOps for SurrealDriver {
     }
 
     async fn remove_communities(&self) -> Result<(), DriverError> {
-        Err(pending("remove_communities"))
+        debug!("surreal remove_communities");
+        // DETACH-equivalent of `MATCH (c:Community) DETACH DELETE c`: drop all
+        // `has_member` edges (the only relation incident to communities), then
+        // every community node. Always full-graph (no group scope) per upstream.
+        self.run_write("DELETE has_member", |q| q, "remove_communities")
+            .await?;
+        self.run_write("DELETE community", |q| q, "remove_communities")
+            .await
     }
 
     async fn get_community_clusters(
         &self,
-        _group_ids: &[String],
+        group_ids: &[String],
     ) -> Result<Vec<GroupClusterProjection>, DriverError> {
-        Err(pending("get_community_clusters"))
+        debug!(count = group_ids.len(), "surreal get_community_clusters");
+
+        // Resolve the group set: explicit param, or all distinct entity
+        // group_ids (mirrors Neo4j's `collect(DISTINCT n.group_id)`).
+        let groups: Vec<String> = if group_ids.is_empty() {
+            self.fetch(
+                "SELECT VALUE group_id FROM entity GROUP BY group_id",
+                |q| q,
+                0,
+                "distinct_entity_group_ids",
+            )
+            .await?
+        } else {
+            group_ids.to_vec()
+        };
+
+        let mut out: Vec<GroupClusterProjection> = Vec::new();
+        for group_id in groups {
+            // Nodes in this group drive the per-node neighbour projection.
+            let nodes = self
+                .get_entity_nodes_by_group_ids(std::slice::from_ref(&group_id))
+                .await?;
+            let mut node_neighbors: Vec<NodeNeighbors> = Vec::with_capacity(nodes.len());
+            for node in &nodes {
+                // Undirected RELATES_TO neighbours within the same group, with
+                // the count of edges to each (mirrors the Neo4j cluster query
+                // `(n)-[e:RELATES_TO]-(m) WITH count(e) AS count, m.uuid`).
+                // SurrealQL has no `UNION ALL`, so we fetch the out- and
+                // in-direction neighbour uuids separately and tally per neighbour
+                // in Rust — one edge ⇒ one tally, both directions counted.
+                let neighbor_uuids = self
+                    .relates_to_neighbor_uuids(&node.uuid, &group_id)
+                    .await?;
+                let mut counts: HashMap<String, u64> = HashMap::new();
+                for u in neighbor_uuids {
+                    *counts.entry(u).or_insert(0) += 1;
+                }
+                let neighbors: Vec<Neighbor> = counts
+                    .into_iter()
+                    .map(|(node_uuid, edge_count)| Neighbor {
+                        node_uuid,
+                        edge_count,
+                    })
+                    .collect();
+                node_neighbors.push(NodeNeighbors {
+                    node_uuid: node.uuid.clone(),
+                    neighbors,
+                });
+            }
+            out.push(GroupClusterProjection {
+                group_id,
+                nodes: node_neighbors,
+            });
+        }
+        Ok(out)
     }
 
     async fn community_of_member(
         &self,
-        _entity_uuid: &str,
+        entity_uuid: &str,
     ) -> Result<Option<CommunityNode>, DriverError> {
-        Err(pending("community_of_member"))
+        debug!(entity_uuid, "surreal community_of_member");
+        // The first community with a `has_member` edge to this entity (mirrors
+        // `MATCH (c:Community)-[:HAS_MEMBER]->(n:Entity {uuid}) RETURN c`).
+        let entity_id = record_id("entity", entity_uuid).into_value();
+        let sql = "SELECT * FROM community \
+                   WHERE id IN (SELECT VALUE in FROM has_member WHERE out = $entity) \
+                   LIMIT 1"
+            .to_string();
+        let params = vec![("entity".to_string(), entity_id)];
+        let rows: Vec<CommunityNodeRow> =
+            self.fetch_dyn(sql, params, "community_of_member").await?;
+        Ok(rows.into_iter().next().map(community_node_from_row))
     }
 
     async fn neighbor_communities(
         &self,
-        _entity_uuid: &str,
+        entity_uuid: &str,
     ) -> Result<Vec<CommunityNode>, DriverError> {
-        Err(pending("neighbor_communities"))
+        debug!(entity_uuid, "surreal neighbor_communities");
+        // Communities of entities RELATES_TO-adjacent (undirected) to this
+        // entity, ONE ROW PER neighbour membership — NOT deduplicated (the
+        // caller does the mode/plurality count). Mirrors `MATCH (c:Community)
+        // -[:HAS_MEMBER]->(m:Entity)-[:RELATES_TO]-(n:Entity {uuid}) RETURN c`.
+        //
+        // Step 1: the undirected RELATES_TO neighbour entity-id set of `entity`.
+        // Step 2: for EACH has_member edge whose target is in that set, load the
+        // owning community (one community row per membership edge, with repeats).
+        let entity_id = record_id("entity", entity_uuid).into_value();
+        // Undirected RELATES_TO neighbour record ids (out- and in-direction
+        // fetched separately — SurrealQL has no `UNION ALL` — then concatenated).
+        let mut neighbor_ids: Vec<surrealdb::types::Value> = self
+            .fetch_dyn(
+                "SELECT VALUE out FROM relates_to WHERE in = $entity".to_string(),
+                vec![("entity".to_string(), entity_id.clone())],
+                "neighbor_communities",
+            )
+            .await?;
+        let mut in_dir: Vec<surrealdb::types::Value> = self
+            .fetch_dyn(
+                "SELECT VALUE in FROM relates_to WHERE out = $entity".to_string(),
+                vec![("entity".to_string(), entity_id)],
+                "neighbor_communities",
+            )
+            .await?;
+        neighbor_ids.append(&mut in_dir);
+        if neighbor_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // The owning community record id for each membership edge targeting a
+        // neighbour — duplicates preserved (one per edge).
+        let community_ids: Vec<surrealdb::types::Value> = self
+            .fetch_dyn(
+                "SELECT VALUE in FROM has_member WHERE out IN $neighbors".to_string(),
+                vec![("neighbors".to_string(), neighbor_ids.into_value())],
+                "neighbor_communities",
+            )
+            .await?;
+        // Load each community row in the same (repeated) order. `SELECT FROM
+        // $id` for a single record returns at most one row; iterate to preserve
+        // the per-membership repetition the caller's mode-count relies on.
+        let mut out: Vec<CommunityNode> = Vec::with_capacity(community_ids.len());
+        for cid in community_ids {
+            let rows: Vec<CommunityNodeRow> = self
+                .fetch_dyn(
+                    "SELECT * FROM $id".to_string(),
+                    vec![("id".to_string(), cid)],
+                    "neighbor_communities",
+                )
+                .await?;
+            if let Some(r) = rows.into_iter().next() {
+                out.push(community_node_from_row(r));
+            }
+        }
+        Ok(out)
     }
 }
 
 impl SurrealDriver {
+    /// Delete every relation row incident to the given entity record ids (as an
+    /// `in` OR `out` endpoint) across the relation tables that can touch an
+    /// entity. This is the explicit DETACH step SurrealDB does not perform on a
+    /// node DELETE.
+    async fn detach_entities(&self, ids: &[surrealdb::types::Value]) -> Result<(), DriverError> {
+        for table in ["relates_to", "mentions", "has_member"] {
+            let sql = format!("DELETE {table} WHERE in IN $ids OR out IN $ids");
+            self.run_write(&sql, |q| q.bind(("ids", ids.to_vec())), "detach_entities")
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Delete every relation row incident to the given episode record id across
+    /// the relation tables that can touch an episodic node (`mentions`,
+    /// `has_episode`, `next_episode`).
+    async fn detach_episode(&self, id: &surrealdb::types::Value) -> Result<(), DriverError> {
+        for table in ["mentions", "has_episode", "next_episode"] {
+            let sql = format!("DELETE {table} WHERE in = $id OR out = $id");
+            self.run_write(&sql, |q| q.bind(("id", id.clone())), "detach_episode")
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Undirected RELATES_TO neighbour uuids of `entity_uuid`, restricted to the
+    /// same `group_id`, with one entry per traversed edge (NOT deduped) so the
+    /// caller can tally per-neighbour edge counts. Out- and in-direction sets are
+    /// fetched separately (SurrealQL has no `UNION ALL`) and concatenated.
+    async fn relates_to_neighbor_uuids(
+        &self,
+        entity_uuid: &str,
+        group_id: &str,
+    ) -> Result<Vec<String>, DriverError> {
+        let node_id = record_id("entity", entity_uuid).into_value();
+        let mut out: Vec<String> = self
+            .fetch_dyn(
+                "SELECT VALUE out.uuid FROM relates_to \
+                 WHERE in = $node AND out.group_id = $group_id"
+                    .to_string(),
+                vec![
+                    ("node".to_string(), node_id.clone()),
+                    ("group_id".to_string(), group_id.to_string().into_value()),
+                ],
+                "relates_to_neighbor_uuids",
+            )
+            .await?;
+        let mut in_dir: Vec<String> = self
+            .fetch_dyn(
+                "SELECT VALUE in.uuid FROM relates_to \
+                 WHERE out = $node AND in.group_id = $group_id"
+                    .to_string(),
+                vec![
+                    ("node".to_string(), node_id),
+                    ("group_id".to_string(), group_id.to_string().into_value()),
+                ],
+                "relates_to_neighbor_uuids",
+            )
+            .await?;
+        out.append(&mut in_dir);
+        Ok(out)
+    }
+
     /// Resolve a HAS_MEMBER target uuid to its record id, preferring an existing
     /// `entity` record and falling back to `community` (sub-community nesting).
     /// A `has_member` edge's target is `entity|community`; we must point at the
@@ -1347,19 +1739,84 @@ impl SagaOps for SurrealDriver {
 
     async fn saga_previous_episode_uuid(
         &self,
-        _saga_uuid: &str,
-        _current_episode_uuid: &str,
+        saga_uuid: &str,
+        current_episode_uuid: &str,
     ) -> Result<Option<String>, DriverError> {
-        Err(pending("saga_previous_episode_uuid"))
+        debug!(saga_uuid, "surreal saga_previous_episode_uuid");
+        // Latest prior episode in the saga (via `has_episode`), excluding the
+        // current one, ORDER valid_at DESC, created_at DESC LIMIT 1. Mirrors the
+        // Neo4j `_saga_get_previous_episode_uuid`.
+        let saga_id = record_id("saga", saga_uuid).into_value();
+        // ORDER idioms (`valid_at`, `created_at`) must appear in the projection,
+        // so we select them alongside `uuid` and pick the uuid of the first row.
+        let sql = "SELECT uuid, valid_at, created_at FROM episodic \
+                   WHERE id IN (SELECT VALUE out FROM has_episode WHERE in = $saga) \
+                     AND uuid != $current \
+                   ORDER BY valid_at DESC, created_at DESC LIMIT 1"
+            .to_string();
+        let params = vec![
+            ("saga".to_string(), saga_id),
+            (
+                "current".to_string(),
+                current_episode_uuid.to_string().into_value(),
+            ),
+        ];
+        let rows: Vec<SagaPreviousEpisodeRow> = self
+            .fetch_dyn(sql, params, "saga_previous_episode_uuid")
+            .await?;
+        Ok(rows.into_iter().next().map(|r| r.uuid))
     }
 
     async fn saga_episode_contents(
         &self,
-        _saga_uuid: &str,
-        _since: Option<DateTime<Utc>>,
-        _limit: usize,
+        saga_uuid: &str,
+        since: Option<DateTime<Utc>>,
+        limit: usize,
     ) -> Result<Vec<(String, DateTime<Utc>)>, DriverError> {
-        Err(pending("saga_episode_contents"))
+        debug!(saga_uuid, limit, "surreal saga_episode_contents");
+        // Episode `(content, valid_at)` rows for a saga via `has_episode`.
+        //   - `since` present: filter created_at > since, ASC (chronological).
+        //   - `since` absent: latest-N (DESC LIMIT) then reverse to chronological
+        //     so the LIMIT keeps the most-recent episodes (matches Neo4j).
+        let saga_id = record_id("saga", saga_uuid).into_value();
+        let member = "id IN (SELECT VALUE out FROM has_episode WHERE in = $saga)";
+        // SurrealDB requires every ORDER idiom to appear in the SELECT
+        // projection, so `created_at` is selected alongside the returned fields.
+        let (sql, reverse) = match since {
+            Some(_) => (
+                format!(
+                    "SELECT content, valid_at, created_at FROM episodic \
+                     WHERE {member} AND created_at > $since \
+                     ORDER BY valid_at ASC, created_at ASC LIMIT $limit"
+                ),
+                false,
+            ),
+            None => (
+                format!(
+                    "SELECT content, valid_at, created_at FROM episodic \
+                     WHERE {member} \
+                     ORDER BY valid_at DESC, created_at DESC LIMIT $limit"
+                ),
+                true,
+            ),
+        };
+        let mut params = vec![
+            ("saga".to_string(), saga_id),
+            ("limit".to_string(), (limit as i64).into_value()),
+        ];
+        if let Some(s) = since {
+            params.push(("since".to_string(), convert::to_dt(s).into_value()));
+        }
+        let rows: Vec<SagaEpisodeContentRow> =
+            self.fetch_dyn(sql, params, "saga_episode_contents").await?;
+        let mut out: Vec<(String, DateTime<Utc>)> = rows
+            .into_iter()
+            .map(|r| (r.content, convert::from_dt(r.valid_at)))
+            .collect();
+        if reverse {
+            out.reverse();
+        }
+        Ok(out)
     }
 }
 
@@ -1714,15 +2171,6 @@ mod tests {
         let n = entity("A", "g1");
         d.save_entity_nodes(std::slice::from_ref(&n)).await.unwrap();
         assert!(d.get_entity_node(&n.uuid).await.unwrap().is_some());
-    }
-
-    #[tokio::test]
-    async fn pending_methods_error_loudly() {
-        // Only Task-3 ops remain pending; Task-2 search ops are implemented.
-        let d = mem().await;
-        assert!(d.get_mentioned_nodes(&["x".into()]).await.is_err());
-        assert!(d.delete_episode("x").await.is_err());
-        assert!(d.remove_communities().await.is_err());
     }
 
     #[tokio::test]
@@ -2248,6 +2696,371 @@ mod tests {
                 .await
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Task-3: transactional bulk save / deletes / clusters / membership / saga
+    // ─────────────────────────────────────────────────────────────────────
+
+    use chronicle_core::types::{CommunityNode, HasEpisodeEdge, SagaNode};
+
+    #[tokio::test]
+    async fn save_all_persists_every_collection_atomically() {
+        let d = mem().await;
+        let a = entity("A", "g1");
+        let b = entity("B", "g1");
+        let ep = episode("ep1", "g1", Utc::now());
+        let ee = edge(&a.uuid, &b.uuid, "KNOWS", "a knows b", "g1");
+        let me = EpisodicEdge::new(ep.uuid.clone(), a.uuid.clone(), "g1".into(), Utc::now());
+
+        d.save_all(
+            std::slice::from_ref(&ep),
+            std::slice::from_ref(&me),
+            &[a.clone(), b.clone()],
+            std::slice::from_ref(&ee),
+        )
+        .await
+        .unwrap();
+
+        // All four collections are queryable after the single transaction.
+        assert!(d.get_entity_node(&a.uuid).await.unwrap().is_some());
+        assert!(d.get_entity_node(&b.uuid).await.unwrap().is_some());
+        assert!(d.get_episode(&ep.uuid).await.unwrap().is_some());
+        assert!(d.get_entity_edge(&ee.uuid).await.unwrap().is_some());
+        // The mentions edge landed (episode → a is reachable via get_mentioned_nodes).
+        let mentioned = d
+            .get_mentioned_nodes(std::slice::from_ref(&ep.uuid))
+            .await
+            .unwrap();
+        assert_eq!(mentioned.len(), 1);
+        assert_eq!(mentioned[0].uuid, a.uuid);
+    }
+
+    #[tokio::test]
+    async fn save_all_empty_batch_is_noop() {
+        let d = mem().await;
+        d.save_all(&[], &[], &[], &[]).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn save_all_rolls_back_on_mid_batch_failure() {
+        // Atomicity proof. The SurrealDB analog of the Neo4j "invalid embedding"
+        // forced failure: a node whose `name_embedding` length does not match the
+        // HNSW DIMENSION (8) makes its UPSERT error inside the transaction.
+        // Statements execute in order, so A's UPSERT applies, B's (dim-3 vector)
+        // fails → the whole batch is cancelled → A must NOT be committed.
+        //
+        // Run on a rocksdb tempdir (the production durable engine), so the
+        // rollback is demonstrated against a real persisted store, not just
+        // kv-mem.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let d = SurrealDriver::connect_embedded(path.to_str().unwrap(), 8)
+            .await
+            .expect("connect_embedded");
+
+        let a = entity("A", "g1"); // valid 8-dim embedding (precedes B)
+        let mut b = entity("B", "g1");
+        b.name_embedding = Some(vec![1.0, 2.0, 3.0]); // dim 3 != 8 → UPSERT errors
+
+        let res = d.save_all(&[], &[], &[a.clone(), b.clone()], &[]).await;
+        assert!(
+            res.is_err(),
+            "mid-batch dimension-violating UPSERT must error"
+        );
+
+        // Nothing committed: node A, applied before the failing B, was rolled
+        // back with the cancelled transaction.
+        assert!(
+            d.get_entity_node(&a.uuid).await.unwrap().is_none(),
+            "node A must NOT be committed after rollback"
+        );
+        assert!(
+            d.get_entity_node(&b.uuid).await.unwrap().is_none(),
+            "node B must NOT be committed after rollback"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_entity_nodes_detaches_edges() {
+        let d = mem().await;
+        let a = entity("a", "g1");
+        let b = entity("b", "g1");
+        d.save_entity_nodes(&[a.clone(), b.clone()]).await.unwrap();
+        let e = edge(&a.uuid, &b.uuid, "KNOWS", "a knows b", "g1");
+        d.save_entity_edges(std::slice::from_ref(&e)).await.unwrap();
+        // An episode that mentions a (the mentions edge must detach too).
+        let ep = episode("ep", "g1", Utc::now());
+        d.save_episode(&ep).await.unwrap();
+        let me = EpisodicEdge::new(ep.uuid.clone(), a.uuid.clone(), "g1".into(), Utc::now());
+        d.save_episodic_edges(std::slice::from_ref(&me))
+            .await
+            .unwrap();
+
+        d.delete_entity_nodes_by_uuids(std::slice::from_ref(&a.uuid))
+            .await
+            .unwrap();
+
+        // Node a is gone; its relates_to and mentions edges are detached.
+        assert!(d.get_entity_node(&a.uuid).await.unwrap().is_none());
+        assert!(d.get_entity_node(&b.uuid).await.unwrap().is_some());
+        assert!(d.get_entity_edge(&e.uuid).await.unwrap().is_none());
+        // No dangling mentions edge to the deleted node.
+        let mentioned = d
+            .get_mentioned_nodes(std::slice::from_ref(&ep.uuid))
+            .await
+            .unwrap();
+        assert!(
+            mentioned.is_empty(),
+            "mentions edge detached on node delete"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_entity_edges_removes_relation_row() {
+        let d = mem().await;
+        let a = entity("a", "g1");
+        let b = entity("b", "g1");
+        d.save_entity_nodes(&[a.clone(), b.clone()]).await.unwrap();
+        let e = edge(&a.uuid, &b.uuid, "KNOWS", "a knows b", "g1");
+        d.save_entity_edges(std::slice::from_ref(&e)).await.unwrap();
+
+        d.delete_entity_edges_by_uuids(std::slice::from_ref(&e.uuid))
+            .await
+            .unwrap();
+        assert!(d.get_entity_edge(&e.uuid).await.unwrap().is_none());
+        // Endpoint nodes survive the edge delete.
+        assert!(d.get_entity_node(&a.uuid).await.unwrap().is_some());
+        assert!(d.get_entity_node(&b.uuid).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn delete_episode_detaches_and_removes() {
+        let d = mem().await;
+        let a = entity("a", "g1");
+        d.save_entity_nodes(std::slice::from_ref(&a)).await.unwrap();
+        let ep = episode("ep", "g1", Utc::now());
+        d.save_episode(&ep).await.unwrap();
+        let me = EpisodicEdge::new(ep.uuid.clone(), a.uuid.clone(), "g1".into(), Utc::now());
+        d.save_episodic_edges(std::slice::from_ref(&me))
+            .await
+            .unwrap();
+
+        d.delete_episode(&ep.uuid).await.unwrap();
+        assert!(d.get_episode(&ep.uuid).await.unwrap().is_none());
+        // Its mentions edge is gone; the mentioned entity survives.
+        assert!(d.get_entity_node(&a.uuid).await.unwrap().is_some());
+        let mentioned = d
+            .get_mentioned_nodes(std::slice::from_ref(&ep.uuid))
+            .await
+            .unwrap();
+        assert!(mentioned.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_mentioned_nodes_distinct() {
+        let d = mem().await;
+        let a = entity("a", "g1");
+        let b = entity("b", "g1");
+        d.save_entity_nodes(&[a.clone(), b.clone()]).await.unwrap();
+        let ep1 = episode("ep1", "g1", Utc::now());
+        let ep2 = episode("ep2", "g1", Utc::now());
+        d.save_episode(&ep1).await.unwrap();
+        d.save_episode(&ep2).await.unwrap();
+        // a mentioned by both episodes; b by ep1 only. DISTINCT → a appears once.
+        d.save_episodic_edges(&[
+            EpisodicEdge::new(ep1.uuid.clone(), a.uuid.clone(), "g1".into(), Utc::now()),
+            EpisodicEdge::new(ep2.uuid.clone(), a.uuid.clone(), "g1".into(), Utc::now()),
+            EpisodicEdge::new(ep1.uuid.clone(), b.uuid.clone(), "g1".into(), Utc::now()),
+        ])
+        .await
+        .unwrap();
+
+        let got = d
+            .get_mentioned_nodes(&[ep1.uuid.clone(), ep2.uuid.clone()])
+            .await
+            .unwrap();
+        let mut names: Vec<String> = got.iter().map(|n| n.name.clone()).collect();
+        names.sort();
+        assert_eq!(names, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn community_cluster_projection_counts_neighbors() {
+        let d = mem().await;
+        // center -- x, center -- y (undirected): center has 2 neighbours.
+        let center = entity("center", "g1");
+        let x = entity("x", "g1");
+        let y = entity("y", "g1");
+        d.save_entity_nodes(&[center.clone(), x.clone(), y.clone()])
+            .await
+            .unwrap();
+        d.save_entity_edges(&[
+            edge(&center.uuid, &x.uuid, "R", "c-x", "g1"),
+            edge(&y.uuid, &center.uuid, "R", "y-c", "g1"),
+        ])
+        .await
+        .unwrap();
+
+        let clusters = d.get_community_clusters(&["g1".to_string()]).await.unwrap();
+        assert_eq!(clusters.len(), 1);
+        let proj = &clusters[0];
+        assert_eq!(proj.group_id, "g1");
+        // center's neighbour list: x and y, each with edge_count 1.
+        let center_row = proj
+            .nodes
+            .iter()
+            .find(|n| n.node_uuid == center.uuid)
+            .expect("center in projection");
+        let mut neigh: Vec<(String, u64)> = center_row
+            .neighbors
+            .iter()
+            .map(|n| (n.node_uuid.clone(), n.edge_count))
+            .collect();
+        neigh.sort();
+        let mut want = vec![(x.uuid.clone(), 1u64), (y.uuid.clone(), 1u64)];
+        want.sort();
+        assert_eq!(neigh, want);
+    }
+
+    #[tokio::test]
+    async fn community_cluster_distinct_groups_when_empty() {
+        let d = mem().await;
+        d.save_entity_nodes(&[entity("a", "g1"), entity("b", "g2")])
+            .await
+            .unwrap();
+        let clusters = d.get_community_clusters(&[]).await.unwrap();
+        let mut groups: Vec<String> = clusters.iter().map(|c| c.group_id.clone()).collect();
+        groups.sort();
+        assert_eq!(groups, vec!["g1".to_string(), "g2".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn community_membership_and_neighbor_votes() {
+        let d = mem().await;
+        // m1, m2 are members of community C; n is related to both m1 and m2.
+        let m1 = entity("m1", "g1");
+        let m2 = entity("m2", "g1");
+        let n = entity("n", "g1");
+        d.save_entity_nodes(&[m1.clone(), m2.clone(), n.clone()])
+            .await
+            .unwrap();
+        d.save_entity_edges(&[
+            edge(&n.uuid, &m1.uuid, "R", "n-m1", "g1"),
+            edge(&m2.uuid, &n.uuid, "R", "m2-n", "g1"),
+        ])
+        .await
+        .unwrap();
+        let c = CommunityNode::new("C".into(), "g1".into(), Utc::now());
+        d.save_community_nodes(std::slice::from_ref(&c))
+            .await
+            .unwrap();
+        d.save_community_edges(&[
+            CommunityEdge::new(c.uuid.clone(), m1.uuid.clone(), "g1".into(), Utc::now()),
+            CommunityEdge::new(c.uuid.clone(), m2.uuid.clone(), "g1".into(), Utc::now()),
+        ])
+        .await
+        .unwrap();
+
+        // m1 already belongs to C.
+        let of = d.community_of_member(&m1.uuid).await.unwrap();
+        assert_eq!(of.map(|c| c.uuid), Some(c.uuid.clone()));
+        // n itself is not a member.
+        assert!(d.community_of_member(&n.uuid).await.unwrap().is_none());
+
+        // n's neighbours (m1, m2) are both in C → TWO rows (NOT deduped).
+        let votes = d.neighbor_communities(&n.uuid).await.unwrap();
+        assert_eq!(
+            votes.len(),
+            2,
+            "one row per neighbour membership, not deduped"
+        );
+        assert!(votes.iter().all(|cn| cn.uuid == c.uuid));
+    }
+
+    #[tokio::test]
+    async fn remove_communities_clears_nodes_and_membership() {
+        let d = mem().await;
+        let m = entity("m", "g1");
+        d.save_entity_nodes(std::slice::from_ref(&m)).await.unwrap();
+        let c = CommunityNode::new("C".into(), "g1".into(), Utc::now());
+        d.save_community_nodes(std::slice::from_ref(&c))
+            .await
+            .unwrap();
+        d.save_community_edges(&[CommunityEdge::new(
+            c.uuid.clone(),
+            m.uuid.clone(),
+            "g1".into(),
+            Utc::now(),
+        )])
+        .await
+        .unwrap();
+
+        d.remove_communities().await.unwrap();
+        assert!(
+            d.get_community_nodes_by_group_ids(&["g1".to_string()])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        // Membership lookup now returns nothing (has_member edges removed).
+        assert!(d.community_of_member(&m.uuid).await.unwrap().is_none());
+        // The member entity itself survives.
+        assert!(d.get_entity_node(&m.uuid).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn saga_previous_episode_and_contents() {
+        let d = mem().await;
+        let s = SagaNode::new("onboarding".into(), "g1".into(), Utc::now());
+        d.save_saga_node(&s).await.unwrap();
+        let base = Utc::now();
+        let e1 = episode("e1", "g1", base - chrono::Duration::hours(3));
+        let e2 = episode("e2", "g1", base - chrono::Duration::hours(2));
+        let e3 = episode("e3", "g1", base - chrono::Duration::hours(1));
+        for ep in [&e1, &e2, &e3] {
+            d.save_episode(ep).await.unwrap();
+            d.save_has_episode_edge(&HasEpisodeEdge::new(
+                s.uuid.clone(),
+                ep.uuid.clone(),
+                "g1".into(),
+                Utc::now(),
+            ))
+            .await
+            .unwrap();
+        }
+
+        // Previous episode relative to e3 = the latest OTHER one = e2.
+        let prev = d
+            .saga_previous_episode_uuid(&s.uuid, &e3.uuid)
+            .await
+            .unwrap();
+        assert_eq!(prev, Some(e2.uuid.clone()));
+
+        // Contents (no watermark): latest-2 then chronological → [e2, e3].
+        let latest2 = d.saga_episode_contents(&s.uuid, None, 2).await.unwrap();
+        let contents: Vec<String> = latest2.iter().map(|(c, _)| c.clone()).collect();
+        assert_eq!(
+            contents,
+            vec!["content of e2".to_string(), "content of e3".to_string()]
+        );
+
+        // Contents since a watermark (after e1's created_at) → only newer rows,
+        // chronological. e1..e3 share near-identical created_at (Utc::now at
+        // save), so use a watermark BEFORE all of them to capture all three ASC.
+        let all = d
+            .saga_episode_contents(&s.uuid, Some(base - chrono::Duration::days(1)), 10)
+            .await
+            .unwrap();
+        let since_contents: Vec<String> = all.iter().map(|(c, _)| c.clone()).collect();
+        assert_eq!(
+            since_contents,
+            vec![
+                "content of e1".to_string(),
+                "content of e2".to_string(),
+                "content of e3".to_string()
+            ]
         );
     }
 }

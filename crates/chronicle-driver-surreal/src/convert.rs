@@ -299,11 +299,30 @@ pub struct EmbeddingRow {
     pub embedding: Vec<f32>,
 }
 
-/// A `(uuid, count)` projection row for the mention-count reranker support.
+/// A `(uuid, count)` projection row for the mention-count reranker support and
+/// the community-cluster neighbour-count projection.
 #[derive(SurrealValue)]
 pub struct MentionCountRow {
     pub uuid: String,
     pub count: i64,
+}
+
+/// A `uuid` projection row for the saga previous-episode lookup. `valid_at` /
+/// `created_at` are carried only to satisfy the ORDER-idiom-in-projection rule.
+#[derive(SurrealValue)]
+pub struct SagaPreviousEpisodeRow {
+    pub uuid: String,
+    pub valid_at: Datetime,
+    pub created_at: Datetime,
+}
+
+/// A `(content, valid_at)` projection row for saga episode-content fetches.
+/// `created_at` is carried only to satisfy the ORDER-idiom-in-projection rule.
+#[derive(SurrealValue)]
+pub struct SagaEpisodeContentRow {
+    pub content: String,
+    pub valid_at: Datetime,
+    pub created_at: Datetime,
 }
 
 // ─────────────────────────────────────────────────────────────────────────

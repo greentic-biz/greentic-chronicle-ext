@@ -103,9 +103,9 @@ A runnable version of this snippet lives at
 |---|---|---|
 | **Phase 0** | Workspace scaffold, crate skeletons, CI | Done |
 | **Phase 1** | Core loop: add_episode (extract → dedup → bi-temporal invalidation → persist), hybrid RRF search, Neo4j driver, OpenAI LLM/embedder, 185 tests green | Done |
-| **Phase 2** | Entity/edge-type registries, attribute extraction, SearchFilters wiring, `save_all` transaction, semaphore fan-out, `extract_summaries_batch` | Planned |
-| **Phase 3** | Kuzu embedded driver (`chronicle-driver-kuzu`) | Planned |
-| **Phase 4** | Communities, sagas, bulk ingest | Planned |
+| **Phase 2** | Full search parity: BFS traversal, MMR / node-distance / episode-mentions / cross-encoder rerankers, `SearchFilters`, multi-scope `search_()` + `search_with_center()`, complete recipe set; D-3 edge-candidate re-ranking closed | Done |
+| **Phase 3** | Entity/edge-type registries + attribute extraction, `extract_summaries_batch`, `save_all` transaction, semaphore fan-out, multi-episode bulk path, Kuzu embedded driver (`chronicle-driver-kuzu`) | Planned |
+| **Phase 4** | Communities, sagas, bulk ingest, community search scope + `SearchResults` community fields | Planned |
 | **v1.x** | FalkorDB driver | Planned |
 
 Full fidelity notes and all ported-module statuses: [`docs/port-fidelity.md`](docs/port-fidelity.md).

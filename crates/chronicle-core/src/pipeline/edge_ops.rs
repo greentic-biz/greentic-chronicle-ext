@@ -24,13 +24,15 @@
 //       HOOK comment, not ported);
 //     - `hydrate_node_summaries` refreshes the prose summary only.
 //
-// * DOCUMENTED DEVIATION — candidate re-ranking (resolve_extracted_edges):
+// * CLOSED (D-3) — candidate re-ranking (resolve_extracted_edges):
 //   Upstream re-ranks the node-pair candidate pool via a hybrid edge search
-//   filtered to the pool's UUIDs (edge_operations.py:392-405). Phase-1 uses the
-//   node-pair pool from `get_edges_between_nodes` DIRECTLY, capped at
-//   RELEVANT_SCHEMA_LIMIT. Same candidate SET; ordering may differ. The
-//   invalidation-candidate set still goes through `edge_search` exactly as
-//   upstream, minus any UUID already present in the related (pair) pool.
+//   filtered to the pool's UUIDs (edge_operations.py:392-405). Phase-2 now ports
+//   this faithfully: `get_edges_between_nodes` provides the UUID source, then a
+//   group-scoped RRF hybrid edge search on the extracted fact (filtered by
+//   `SearchFilters { edge_uuids: Some(pool_uuids), .. }`) produces the ranked
+//   related-edge list. An empty pool short-circuits to no candidates. The
+//   invalidation-candidate set goes through `edge_search` with explicit empty
+//   `SearchFilters`, minus any UUID already present in the related pool.
 //
 // * DOCUMENTED DEVIATION — dedupe_edges context serialization:
 //   Upstream interpolates the Python list-of-dicts `[{'idx': i, 'fact': ...}]`
@@ -259,18 +261,47 @@ pub async fn resolve_extracted_edges(
         edge.fact_embedding = Some(emb);
     }
 
-    // (b) related_edges per extracted edge = the node-pair pool, capped at
-    // RELEVANT_SCHEMA_LIMIT (DOCUMENTED DEVIATION: no hybrid re-rank).
+    // (b) related_edges per extracted edge (upstream 392-405, D-3 CLOSED):
+    //   1. fetch the node-pair pool via get_edges_between_nodes — this is the
+    //      UUID SOURCE only (upstream `valid_edges_list[i]`);
+    //   2. re-rank that pool by running a hybrid edge search on the extracted
+    //      fact, scoped to the pool's UUIDs via
+    //      `SearchFilters { edge_uuids: Some(pool_uuids), .. }` (RRF recipe,
+    //      group-scoped). An empty pool yields no candidates → skip the search.
     // (d) existing_edges (invalidation candidates) per edge = edge_search over the
-    // fact, minus any uuid already in the related pool (upstream 392-430).
+    //   fact with explicit empty SearchFilters, minus any uuid already in the
+    //   related (re-ranked) pool (upstream 406-430).
     let mut per_edge_inputs: Vec<(Vec<EntityEdge>, Vec<EntityEdge>)> =
         Vec::with_capacity(extracted_edges.len());
     for edge in &extracted_edges {
-        let mut related = clients
+        // (1) pair-pool fetch — UUID source for the edge_uuids filter.
+        let mut pool = clients
             .driver
             .get_edges_between_nodes(&edge.source_node_uuid, &edge.target_node_uuid)
             .await?;
-        related.truncate(RELEVANT_SCHEMA_LIMIT);
+        pool.truncate(RELEVANT_SCHEMA_LIMIT);
+
+        // (2) related_edges = hybrid edge search on the fact, scoped to the pool
+        // UUIDs. Empty pool → no candidates (skip the search entirely).
+        let related: Vec<EntityEdge> = if pool.is_empty() {
+            Vec::new()
+        } else {
+            let pool_uuids: Vec<String> = pool.iter().map(|e| e.uuid.clone()).collect();
+            edge_search_simple(
+                clients.driver.as_ref(),
+                clients.embedder.as_ref(),
+                // RRF recipe — no cross_encoder needed.
+                None,
+                &edge.fact,
+                std::slice::from_ref(&edge.group_id),
+                &edge_hybrid_search_rrf(),
+                &crate::search::filters::SearchFilters {
+                    edge_uuids: Some(pool_uuids),
+                    ..Default::default()
+                },
+            )
+            .await?
+        };
         let related_uuids: std::collections::HashSet<String> =
             related.iter().map(|e| e.uuid.clone()).collect();
 
@@ -282,9 +313,8 @@ pub async fn resolve_extracted_edges(
             &edge.fact,
             std::slice::from_ref(&edge.group_id),
             &edge_hybrid_search_rrf(),
-            // D-3 edge-candidate re-ranking closes in Task 7; for now the
-            // invalidation search passes empty filters (upstream-faithful for
-            // the invalidation candidates, which use no SearchFilters).
+            // Invalidation candidates use no SearchFilters (upstream
+            // `SearchFilters()`), passed explicitly here.
             &crate::search::filters::SearchFilters::default(),
         )
         .await?;

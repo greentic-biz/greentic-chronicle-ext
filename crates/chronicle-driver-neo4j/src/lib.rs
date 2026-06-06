@@ -35,11 +35,14 @@ use tracing::debug;
 use std::collections::HashMap;
 
 use chronicle_core::driver::{
-    DriverError, EntityEdgeOps, EntityNodeOps, EpisodeOps, EpisodicEdgeOps, GraphDriver, SchemaOps,
-    SearchOps,
+    CommunityOps, DriverError, EntityEdgeOps, EntityNodeOps, EpisodeOps, EpisodicEdgeOps,
+    GraphDriver, GroupClusterProjection, Neighbor, NodeNeighbors, SagaOps, SchemaOps, SearchOps,
 };
 use chronicle_core::search::filters::SearchFilters;
-use chronicle_core::types::{EntityEdge, EntityNode, EpisodeType, EpisodicEdge, EpisodicNode};
+use chronicle_core::types::{
+    CommunityEdge, CommunityNode, EntityEdge, EntityNode, EpisodeType, EpisodicEdge, EpisodicNode,
+    HasEpisodeEdge, NextEpisodeEdge, SagaNode,
+};
 
 /// Neo4j-backed `GraphDriver`.
 pub struct Neo4jDriver {
@@ -168,6 +171,61 @@ impl EntityNodeOps for Neo4jDriver {
             .await?;
         rows.iter().map(convert::entity_node_from_row).collect()
     }
+
+    async fn get_entity_nodes_by_group_ids(
+        &self,
+        group_ids: &[String],
+    ) -> Result<Vec<EntityNode>, DriverError> {
+        debug!(
+            count = group_ids.len(),
+            "neo4j get_entity_nodes_by_group_ids"
+        );
+        if group_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let cypher = format!(
+            "MATCH (n:Entity) WHERE n.group_id IN $group_ids RETURN{}",
+            queries::ENTITY_NODE_RETURN
+        );
+        let rows = self
+            .fetch_rows(
+                query(&cypher).param("group_ids", group_ids.to_vec()),
+                "get_entity_nodes_by_group_ids",
+            )
+            .await?;
+        rows.iter().map(convert::entity_node_from_row).collect()
+    }
+
+    async fn get_mentioned_nodes(
+        &self,
+        episode_uuids: &[String],
+    ) -> Result<Vec<EntityNode>, DriverError> {
+        debug!(count = episode_uuids.len(), "neo4j get_mentioned_nodes");
+        if episode_uuids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let cypher = format!(
+            "{}{}",
+            queries::GET_MENTIONED_NODES,
+            queries::ENTITY_NODE_RETURN
+        );
+        let rows = self
+            .fetch_rows(
+                query(&cypher).param("uuids", episode_uuids.to_vec()),
+                "get_mentioned_nodes",
+            )
+            .await?;
+        rows.iter().map(convert::entity_node_from_row).collect()
+    }
+
+    async fn delete_entity_nodes_by_uuids(&self, uuids: &[String]) -> Result<(), DriverError> {
+        debug!(count = uuids.len(), "neo4j delete_entity_nodes_by_uuids");
+        if uuids.is_empty() {
+            return Ok(());
+        }
+        let q = query(queries::DELETE_ENTITY_NODES_BY_UUIDS).param("uuids", uuids.to_vec());
+        self.run_in_txn(q, "delete_entity_nodes_by_uuids").await
+    }
 }
 
 #[async_trait]
@@ -221,6 +279,37 @@ impl EntityEdgeOps for Neo4jDriver {
             )
             .await?;
         rows.iter().map(convert::entity_edge_from_row).collect()
+    }
+
+    async fn get_entity_edges_by_uuids(
+        &self,
+        uuids: &[String],
+    ) -> Result<Vec<EntityEdge>, DriverError> {
+        debug!(count = uuids.len(), "neo4j get_entity_edges_by_uuids");
+        if uuids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let cypher = format!(
+            "{}{}",
+            queries::GET_ENTITY_EDGES_BY_UUIDS,
+            queries::ENTITY_EDGE_RETURN
+        );
+        let rows = self
+            .fetch_rows(
+                query(&cypher).param("uuids", uuids.to_vec()),
+                "get_entity_edges_by_uuids",
+            )
+            .await?;
+        rows.iter().map(convert::entity_edge_from_row).collect()
+    }
+
+    async fn delete_entity_edges_by_uuids(&self, uuids: &[String]) -> Result<(), DriverError> {
+        debug!(count = uuids.len(), "neo4j delete_entity_edges_by_uuids");
+        if uuids.is_empty() {
+            return Ok(());
+        }
+        let q = query(queries::DELETE_ENTITY_EDGES_BY_UUIDS).param("uuids", uuids.to_vec());
+        self.run_in_txn(q, "delete_entity_edges_by_uuids").await
     }
 }
 
@@ -310,6 +399,12 @@ impl EpisodeOps for Neo4jDriver {
         // Upstream returns ORDER BY valid_at DESC then reverses to chronological.
         episodes.reverse();
         Ok(episodes)
+    }
+
+    async fn delete_episode(&self, uuid: &str) -> Result<(), DriverError> {
+        debug!(uuid, "neo4j delete_episode");
+        let q = query(queries::DELETE_EPISODE).param("uuid", uuid);
+        self.run_in_txn(q, "delete_episode").await
     }
 }
 
@@ -635,6 +730,386 @@ impl SearchOps for Neo4jDriver {
             })?;
             // count(*) is non-negative; clamp defensively for the u64 cast.
             out.insert(uuid, score.max(0) as u64);
+        }
+        Ok(out)
+    }
+}
+
+#[async_trait]
+impl CommunityOps for Neo4jDriver {
+    async fn save_community_nodes(&self, nodes: &[CommunityNode]) -> Result<(), DriverError> {
+        debug!(count = nodes.len(), "neo4j save_community_nodes");
+        if nodes.is_empty() {
+            return Ok(());
+        }
+        let payload: Vec<_> = nodes.iter().map(convert::community_node_to_bolt).collect();
+        let q = query(queries::SAVE_COMMUNITY_NODES).param("nodes", payload);
+        self.run_in_txn(q, "save_community_nodes").await
+    }
+
+    async fn save_community_edges(&self, edges: &[CommunityEdge]) -> Result<(), DriverError> {
+        debug!(count = edges.len(), "neo4j save_community_edges");
+        if edges.is_empty() {
+            return Ok(());
+        }
+        let payload: Vec<_> = edges.iter().map(convert::community_edge_to_bolt).collect();
+        let q = query(queries::SAVE_COMMUNITY_EDGES).param("edges", payload);
+        self.run_in_txn(q, "save_community_edges").await
+    }
+
+    async fn get_community_nodes_by_group_ids(
+        &self,
+        group_ids: &[String],
+    ) -> Result<Vec<CommunityNode>, DriverError> {
+        debug!(
+            count = group_ids.len(),
+            "neo4j get_community_nodes_by_group_ids"
+        );
+        if group_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let cypher = format!(
+            "{}{}",
+            queries::GET_COMMUNITY_NODES_BY_GROUP_IDS,
+            queries::COMMUNITY_NODE_RETURN
+        );
+        let rows = self
+            .fetch_rows(
+                query(&cypher).param("group_ids", group_ids.to_vec()),
+                "get_community_nodes_by_group_ids",
+            )
+            .await?;
+        rows.iter().map(convert::community_node_from_row).collect()
+    }
+
+    async fn get_community_nodes_by_uuids(
+        &self,
+        uuids: &[String],
+    ) -> Result<Vec<CommunityNode>, DriverError> {
+        debug!(count = uuids.len(), "neo4j get_community_nodes_by_uuids");
+        if uuids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let cypher = format!(
+            "{}{}",
+            queries::GET_COMMUNITY_NODES_BY_UUIDS,
+            queries::COMMUNITY_NODE_RETURN
+        );
+        let rows = self
+            .fetch_rows(
+                query(&cypher).param("uuids", uuids.to_vec()),
+                "get_community_nodes_by_uuids",
+            )
+            .await?;
+        rows.iter().map(convert::community_node_from_row).collect()
+    }
+
+    async fn community_fulltext_search(
+        &self,
+        query_text: &str,
+        group_ids: &[String],
+        limit: usize,
+    ) -> Result<Vec<CommunityNode>, DriverError> {
+        debug!(query_text, limit, "neo4j community_fulltext_search");
+        let Some(fuzzy) = build_fulltext_query(query_text, group_ids)? else {
+            return Ok(Vec::new());
+        };
+        let mut cypher = String::from(queries::COMMUNITY_FULLTEXT_SEARCH_HEAD);
+        if !group_ids.is_empty() {
+            cypher.push_str(queries::COMMUNITY_FULLTEXT_GROUP_FILTER);
+        }
+        cypher.push_str(queries::COMMUNITY_FULLTEXT_SEARCH_TAIL);
+        let mut q = query(&cypher)
+            .param("query", fuzzy)
+            .param("limit", limit as i64);
+        if !group_ids.is_empty() {
+            q = q.param("group_ids", group_ids.to_vec());
+        }
+        let rows = self.fetch_rows(q, "community_fulltext_search").await?;
+        rows.iter().map(convert::community_node_from_row).collect()
+    }
+
+    async fn community_similarity_search(
+        &self,
+        search_vector: &[f32],
+        group_ids: &[String],
+        limit: usize,
+        min_score: f32,
+    ) -> Result<Vec<CommunityNode>, DriverError> {
+        debug!(limit, min_score, "neo4j community_similarity_search");
+        let mut cypher = String::from(queries::COMMUNITY_SIMILARITY_SEARCH_HEAD);
+        if !group_ids.is_empty() {
+            cypher.push_str(queries::COMMUNITY_SIMILARITY_GROUP_FILTER);
+        }
+        cypher.push_str(queries::COMMUNITY_SIMILARITY_SEARCH_TAIL);
+        let vector: Vec<f64> = search_vector.iter().map(|f| *f as f64).collect();
+        let mut q = query(&cypher)
+            .param("search_vector", vector)
+            .param("limit", limit as i64)
+            .param("min_score", min_score as f64);
+        if !group_ids.is_empty() {
+            q = q.param("group_ids", group_ids.to_vec());
+        }
+        let rows = self.fetch_rows(q, "community_similarity_search").await?;
+        rows.iter().map(convert::community_node_from_row).collect()
+    }
+
+    async fn get_embeddings_for_communities(
+        &self,
+        uuids: &[String],
+    ) -> Result<HashMap<String, Vec<f32>>, DriverError> {
+        debug!(count = uuids.len(), "neo4j get_embeddings_for_communities");
+        if uuids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let q = query(queries::GET_COMMUNITY_EMBEDDINGS).param("uuids", uuids.to_vec());
+        let rows = self.fetch_rows(q, "get_embeddings_for_communities").await?;
+        let mut out = HashMap::with_capacity(rows.len());
+        for row in &rows {
+            if let Some((uuid, emb)) = convert::embedding_row(row)? {
+                out.insert(uuid, emb);
+            }
+        }
+        Ok(out)
+    }
+
+    async fn remove_communities(&self) -> Result<(), DriverError> {
+        debug!("neo4j remove_communities");
+        self.run_in_txn(query(queries::REMOVE_COMMUNITIES), "remove_communities")
+            .await
+    }
+
+    async fn get_community_clusters(
+        &self,
+        group_ids: &[String],
+    ) -> Result<Vec<GroupClusterProjection>, DriverError> {
+        debug!(count = group_ids.len(), "neo4j get_community_clusters");
+
+        // Resolve the group set: explicit param, or all distinct entity group_ids.
+        let groups: Vec<String> = if group_ids.is_empty() {
+            let rows = self
+                .fetch_rows(
+                    query(queries::DISTINCT_ENTITY_GROUP_IDS),
+                    "distinct_entity_group_ids",
+                )
+                .await?;
+            match rows.first() {
+                Some(row) => row.get("group_ids").map_err(|e| {
+                    DriverError::Decode(format!("distinct group_ids row missing column: {e}"))
+                })?,
+                None => Vec::new(),
+            }
+        } else {
+            group_ids.to_vec()
+        };
+
+        let mut out: Vec<GroupClusterProjection> = Vec::new();
+        for group_id in groups {
+            // Nodes in this group (drives the per-node neighbour projection).
+            let nodes = self
+                .get_entity_nodes_by_group_ids(std::slice::from_ref(&group_id))
+                .await?;
+            let mut node_neighbors: Vec<NodeNeighbors> = Vec::with_capacity(nodes.len());
+            for node in &nodes {
+                let rows = self
+                    .fetch_rows(
+                        query(queries::COMMUNITY_CLUSTER_NODE_NEIGHBORS)
+                            .param("group_id", group_id.as_str())
+                            .param("uuid", node.uuid.as_str()),
+                        "community_cluster_node_neighbors",
+                    )
+                    .await?;
+                let mut neighbors: Vec<Neighbor> = Vec::with_capacity(rows.len());
+                for row in &rows {
+                    let node_uuid: String = row.get("uuid").map_err(|e| {
+                        DriverError::Decode(format!("cluster neighbour row missing uuid: {e}"))
+                    })?;
+                    let count: i64 = row.get("count").map_err(|e| {
+                        DriverError::Decode(format!("cluster neighbour row missing count: {e}"))
+                    })?;
+                    neighbors.push(Neighbor {
+                        node_uuid,
+                        edge_count: count.max(0) as u64,
+                    });
+                }
+                node_neighbors.push(NodeNeighbors {
+                    node_uuid: node.uuid.clone(),
+                    neighbors,
+                });
+            }
+            out.push(GroupClusterProjection {
+                group_id,
+                nodes: node_neighbors,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn community_of_member(
+        &self,
+        entity_uuid: &str,
+    ) -> Result<Option<CommunityNode>, DriverError> {
+        debug!(entity_uuid, "neo4j community_of_member");
+        let cypher = format!(
+            "{}{}",
+            queries::COMMUNITY_OF_MEMBER,
+            queries::COMMUNITY_NODE_RETURN
+        );
+        let rows = self
+            .fetch_rows(
+                query(&cypher).param("entity_uuid", entity_uuid),
+                "community_of_member",
+            )
+            .await?;
+        match rows.first() {
+            Some(row) => Ok(Some(convert::community_node_from_row(row)?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn neighbor_communities(
+        &self,
+        entity_uuid: &str,
+    ) -> Result<Vec<CommunityNode>, DriverError> {
+        debug!(entity_uuid, "neo4j neighbor_communities");
+        let cypher = format!(
+            "{}{}",
+            queries::NEIGHBOR_COMMUNITIES,
+            queries::COMMUNITY_NODE_RETURN
+        );
+        let rows = self
+            .fetch_rows(
+                query(&cypher).param("entity_uuid", entity_uuid),
+                "neighbor_communities",
+            )
+            .await?;
+        rows.iter().map(convert::community_node_from_row).collect()
+    }
+}
+
+#[async_trait]
+impl SagaOps for Neo4jDriver {
+    async fn save_saga_node(&self, node: &SagaNode) -> Result<(), DriverError> {
+        debug!(uuid = node.uuid, "neo4j save_saga_node");
+        let q = query(queries::SAVE_SAGA_NODE)
+            .param("uuid", node.uuid.as_str())
+            .param("name", node.name.as_str())
+            .param("group_id", node.group_id.as_str())
+            .param("created_at", node.created_at.fixed_offset())
+            .param("summary", node.summary.as_str())
+            .param(
+                "first_episode_uuid",
+                convert::opt_str_param(node.first_episode_uuid.as_deref()),
+            )
+            .param(
+                "last_episode_uuid",
+                convert::opt_str_param(node.last_episode_uuid.as_deref()),
+            )
+            .param(
+                "last_summarized_at",
+                convert::opt_datetime_param(node.last_summarized_at),
+            )
+            .param(
+                "last_summarized_episode_valid_at",
+                convert::opt_datetime_param(node.last_summarized_episode_valid_at),
+            );
+        self.run_in_txn(q, "save_saga_node").await
+    }
+
+    async fn save_has_episode_edge(&self, edge: &HasEpisodeEdge) -> Result<(), DriverError> {
+        debug!(uuid = edge.uuid, "neo4j save_has_episode_edge");
+        let q = query(queries::SAVE_HAS_EPISODE_EDGE)
+            .param("saga_uuid", edge.source_node_uuid.as_str())
+            .param("episode_uuid", edge.target_node_uuid.as_str())
+            .param("uuid", edge.uuid.as_str())
+            .param("group_id", edge.group_id.as_str())
+            .param("created_at", edge.created_at.fixed_offset());
+        self.run_in_txn(q, "save_has_episode_edge").await
+    }
+
+    async fn save_next_episode_edge(&self, edge: &NextEpisodeEdge) -> Result<(), DriverError> {
+        debug!(uuid = edge.uuid, "neo4j save_next_episode_edge");
+        let q = query(queries::SAVE_NEXT_EPISODE_EDGE)
+            .param("source_episode_uuid", edge.source_node_uuid.as_str())
+            .param("target_episode_uuid", edge.target_node_uuid.as_str())
+            .param("uuid", edge.uuid.as_str())
+            .param("group_id", edge.group_id.as_str())
+            .param("created_at", edge.created_at.fixed_offset());
+        self.run_in_txn(q, "save_next_episode_edge").await
+    }
+
+    async fn get_saga_by_name(
+        &self,
+        name: &str,
+        group_id: &str,
+    ) -> Result<Option<SagaNode>, DriverError> {
+        debug!(name, group_id, "neo4j get_saga_by_name");
+        let cypher = format!("{}{}", queries::GET_SAGA_BY_NAME, queries::SAGA_NODE_RETURN);
+        let rows = self
+            .fetch_rows(
+                query(&cypher)
+                    .param("name", name)
+                    .param("group_id", group_id),
+                "get_saga_by_name",
+            )
+            .await?;
+        match rows.first() {
+            Some(row) => Ok(Some(convert::saga_node_from_row(row)?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn saga_previous_episode_uuid(
+        &self,
+        saga_uuid: &str,
+        current_episode_uuid: &str,
+    ) -> Result<Option<String>, DriverError> {
+        debug!(saga_uuid, "neo4j saga_previous_episode_uuid");
+        let rows = self
+            .fetch_rows(
+                query(queries::SAGA_PREVIOUS_EPISODE_UUID)
+                    .param("saga_uuid", saga_uuid)
+                    .param("current_episode_uuid", current_episode_uuid),
+                "saga_previous_episode_uuid",
+            )
+            .await?;
+        match rows.first() {
+            Some(row) => {
+                let uuid: String = row.get("uuid").map_err(|e| {
+                    DriverError::Decode(format!("saga previous-episode row missing uuid: {e}"))
+                })?;
+                Ok(Some(uuid))
+            }
+            None => Ok(None),
+        }
+    }
+
+    async fn saga_episode_contents(
+        &self,
+        saga_uuid: &str,
+        since: Option<DateTime<Utc>>,
+        limit: usize,
+    ) -> Result<Vec<(String, DateTime<Utc>)>, DriverError> {
+        debug!(saga_uuid, limit, "neo4j saga_episode_contents");
+        let (cypher, reverse) = match since {
+            Some(_) => (queries::SAGA_EPISODE_CONTENTS_SINCE, false),
+            None => (queries::SAGA_EPISODE_CONTENTS_ALL, true),
+        };
+        let mut q = query(cypher)
+            .param("saga_uuid", saga_uuid)
+            .param("limit", limit as i64);
+        if let Some(s) = since {
+            q = q.param("since", s.fixed_offset());
+        }
+        let rows = self.fetch_rows(q, "saga_episode_contents").await?;
+        let mut out: Vec<(String, DateTime<Utc>)> = Vec::with_capacity(rows.len());
+        for row in &rows {
+            out.push(convert::saga_episode_content_row(row)?);
+        }
+        // The no-watermark query orders DESC LIMIT to keep the latest episodes,
+        // matching upstream; reverse to chronological order before returning.
+        if reverse {
+            out.reverse();
         }
         Ok(out)
     }

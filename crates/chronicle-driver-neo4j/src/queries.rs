@@ -870,6 +870,297 @@ pub fn drop_index_statements() -> Vec<String> {
 }
 
 // =====================================================================
+// PHASE-4 COMMUNITY + SAGA + MAINTENANCE QUERIES
+// =====================================================================
+//
+// Ported from upstream @ 34f56e65 (Neo4j/default branch):
+// - `models/nodes/node_db_queries.py`  (community/saga save + COMMUNITY/SAGA RETURN)
+// - `models/edges/edge_db_queries.py`  (HAS_MEMBER / HAS_EPISODE / NEXT_EPISODE save)
+// - `utils/maintenance/community_operations.py` (clusters projection, membership,
+//    remove_communities)
+// - `search/search_utils.py` (community fulltext/similarity, embeddings,
+//    get_mentioned_nodes)
+// - `graphiti.py` (saga get_or_create lookup, previous-episode, episode-contents)
+// - `nodes.py` / `edges.py` (get_by_uuids / get_by_group_ids / delete_by_uuids)
+
+/// Community-node RETURN clause (verbatim `COMMUNITY_NODE_RETURN`, alias `c`).
+pub const COMMUNITY_NODE_RETURN: &str = r#"
+    c.uuid AS uuid,
+    c.name AS name,
+    c.group_id AS group_id,
+    c.created_at AS created_at,
+    c.name_embedding AS name_embedding,
+    c.summary AS summary
+"#;
+
+/// Save community nodes (UNWIND form of `get_community_node_save_query`, Neo4j
+/// branch). Upstream single-node form sets `SET n = {uuid,name,group_id,summary,
+/// created_at}` then `db.create.setNodeVectorProperty(n,"name_embedding",...)`.
+/// We batch via UNWIND and pass scalar props under `node.props`, with the same
+/// embedding guard used for entity nodes (the vector procedure cannot run in
+/// FOREACH and must tolerate a null embedding).
+pub const SAVE_COMMUNITY_NODES: &str = r#"
+    UNWIND $nodes AS node
+    MERGE (n:Community {uuid: node.uuid})
+    SET n += node.props
+    WITH n, node
+    WHERE node.name_embedding IS NOT NULL
+    CALL db.create.setNodeVectorProperty(n, "name_embedding", node.name_embedding)
+    RETURN count(*) AS c
+"#;
+
+/// Save HAS_MEMBER edges (UNWIND form of `get_community_edge_save_query`, Neo4j
+/// branch): `MATCH (community:Community) MATCH (node:Entity|Community) MERGE
+/// (community)-[e:HAS_MEMBER {uuid}]->(node) SET e = {uuid,group_id,created_at}`.
+pub const SAVE_COMMUNITY_EDGES: &str = r#"
+    UNWIND $edges AS edge
+    MATCH (community:Community {uuid: edge.source_node_uuid})
+    MATCH (node:Entity | Community {uuid: edge.target_node_uuid})
+    MERGE (community)-[e:HAS_MEMBER {uuid: edge.uuid}]->(node)
+    SET
+        e.group_id = edge.group_id,
+        e.created_at = edge.created_at
+    RETURN e.uuid AS uuid
+"#;
+
+/// Community nodes by uuid (`CommunityNode.get_by_uuids`).
+pub const GET_COMMUNITY_NODES_BY_UUIDS: &str = r#"
+    MATCH (c:Community)
+    WHERE c.uuid IN $uuids
+    RETURN
+"#;
+
+/// Community nodes by group_id (`CommunityNode.get_by_group_ids`).
+pub const GET_COMMUNITY_NODES_BY_GROUP_IDS: &str = r#"
+    MATCH (c:Community)
+    WHERE c.group_id IN $group_ids
+    RETURN
+"#;
+
+/// Community fulltext search head (R8 `community_fulltext_search`, Neo4j branch):
+/// `CALL db.index.fulltext.queryNodes("community_name", $query, {limit})
+///  YIELD node AS c, score WITH c, score`. Optional group filter + RETURN +
+/// ORDER BY score DESC LIMIT appended at call time.
+pub const COMMUNITY_FULLTEXT_SEARCH_HEAD: &str = r#"
+    CALL db.index.fulltext.queryNodes("community_name", $query, {limit: $limit})
+    YIELD node AS c, score
+    WITH c, score
+"#;
+
+pub const COMMUNITY_FULLTEXT_GROUP_FILTER: &str = "WHERE c.group_id IN $group_ids";
+
+pub const COMMUNITY_FULLTEXT_SEARCH_TAIL: &str = r#"
+    RETURN
+    c.uuid AS uuid,
+    c.name AS name,
+    c.group_id AS group_id,
+    c.created_at AS created_at,
+    c.name_embedding AS name_embedding,
+    c.summary AS summary
+    ORDER BY score DESC
+    LIMIT $limit
+"#;
+
+/// Community similarity search head (R8 `community_similarity_search`, Neo4j
+/// branch): `MATCH (c:Community) [WHERE c.group_id IN $group_ids] WITH c,
+/// vector.similarity.cosine(c.name_embedding, $search_vector) AS score WHERE
+/// score > $min_score RETURN ... ORDER BY score DESC LIMIT $limit`. We add a
+/// `c.name_embedding IS NOT NULL` guard (partial saves) — observable result is
+/// unchanged (null embeddings cannot exceed min_score).
+pub const COMMUNITY_SIMILARITY_SEARCH_HEAD: &str = "\n    MATCH (c:Community)";
+
+pub const COMMUNITY_SIMILARITY_GROUP_FILTER: &str = "\n    WHERE c.group_id IN $group_ids";
+
+pub const COMMUNITY_SIMILARITY_SEARCH_TAIL: &str = r#"
+    WITH c, vector.similarity.cosine(c.name_embedding, $search_vector) AS score
+    WHERE score > $min_score
+    RETURN
+    c.uuid AS uuid,
+    c.name AS name,
+    c.group_id AS group_id,
+    c.created_at AS created_at,
+    c.name_embedding AS name_embedding,
+    c.summary AS summary
+    ORDER BY score DESC
+    LIMIT $limit
+"#;
+
+/// Community-embedding loader (R8 `get_embeddings_for_communities`, Neo4j branch).
+/// Same null-guard rationale as the node/edge embedding loaders.
+pub const GET_COMMUNITY_EMBEDDINGS: &str = r#"
+    MATCH (c:Community)
+    WHERE c.uuid IN $uuids AND c.name_embedding IS NOT NULL
+    RETURN DISTINCT c.uuid AS uuid, c.name_embedding AS embedding
+"#;
+
+/// `remove_communities` (R3): `MATCH (c:Community) DETACH DELETE c`.
+pub const REMOVE_COMMUNITIES: &str = r#"
+    MATCH (c:Community)
+    DETACH DELETE c
+"#;
+
+/// Distinct entity group_ids (used when `get_community_clusters` is called with
+/// no group_ids — upstream `MATCH (n:Entity) WHERE n.group_id IS NOT NULL RETURN
+/// collect(DISTINCT n.group_id) AS group_ids`).
+pub const DISTINCT_ENTITY_GROUP_IDS: &str = r#"
+    MATCH (n:Entity)
+    WHERE n.group_id IS NOT NULL
+    RETURN collect(DISTINCT n.group_id) AS group_ids
+"#;
+
+/// Per-node RELATES_TO neighbour counts within a group (R2 cluster projection).
+/// Verbatim from `get_community_clusters` (Neo4j branch):
+/// `MATCH (n:Entity {group_id, uuid})-[e:RELATES_TO]-(m:Entity {group_id})
+///  WITH count(e) AS count, m.uuid AS uuid RETURN uuid, count`.
+pub const COMMUNITY_CLUSTER_NODE_NEIGHBORS: &str = r#"
+    MATCH (n:Entity {group_id: $group_id, uuid: $uuid})-[e:RELATES_TO]-(m:Entity {group_id: $group_id})
+    WITH count(e) AS count, m.uuid AS uuid
+    RETURN
+        uuid,
+        count
+"#;
+
+/// Already-member lookup (R4 step a, `determine_entity_community`):
+/// `MATCH (c:Community)-[:HAS_MEMBER]->(n:Entity {uuid}) RETURN <community>`.
+pub const COMMUNITY_OF_MEMBER: &str = r#"
+    MATCH (c:Community)-[:HAS_MEMBER]->(n:Entity {uuid: $entity_uuid})
+    RETURN
+"#;
+
+/// Neighbour-vote lookup (R4 step b): ONE row per neighbour's community (NOT
+/// deduplicated). `MATCH (c:Community)-[:HAS_MEMBER]->(m:Entity)-[:RELATES_TO]-
+/// (n:Entity {uuid}) RETURN <community>`.
+pub const NEIGHBOR_COMMUNITIES: &str = r#"
+    MATCH (c:Community)-[:HAS_MEMBER]->(m:Entity)-[:RELATES_TO]-(n:Entity {uuid: $entity_uuid})
+    RETURN
+"#;
+
+/// Entity nodes mentioned by episodes (R5/R10 `get_mentioned_nodes`):
+/// `MATCH (episode:Episodic)-[:MENTIONS]->(n:Entity) WHERE episode.uuid IN $uuids
+///  RETURN DISTINCT <entity_node_return>`.
+pub const GET_MENTIONED_NODES: &str = r#"
+    MATCH (episode:Episodic)-[:MENTIONS]->(n:Entity)
+    WHERE episode.uuid IN $uuids
+    RETURN DISTINCT
+"#;
+
+/// Entity edges by uuid (`EntityEdge.get_by_uuids`, Neo4j branch):
+/// `MATCH (n:Entity)-[e:RELATES_TO]->(m:Entity) WHERE e.uuid IN $uuids RETURN`.
+pub const GET_ENTITY_EDGES_BY_UUIDS: &str = r#"
+    MATCH (n:Entity)-[e:RELATES_TO]->(m:Entity)
+    WHERE e.uuid IN $uuids
+    RETURN
+"#;
+
+/// Delete RELATES_TO edges by uuid (R5, `Edge.delete_by_uuids` Neo4j branch):
+/// `MATCH (n)-[e:MENTIONS|RELATES_TO|HAS_MEMBER]->(m) WHERE e.uuid IN $uuids
+///  DELETE e`. We scope to RELATES_TO (the entity-edge delete path).
+pub const DELETE_ENTITY_EDGES_BY_UUIDS: &str = r#"
+    MATCH ()-[e:RELATES_TO]->()
+    WHERE e.uuid IN $uuids
+    DELETE e
+"#;
+
+/// Delete Entity nodes by uuid (R5, `Node.delete_by_uuids` Neo4j branch):
+/// `MATCH (n:Entity) WHERE n.uuid IN $uuids DETACH DELETE n`.
+pub const DELETE_ENTITY_NODES_BY_UUIDS: &str = r#"
+    MATCH (n:Entity)
+    WHERE n.uuid IN $uuids
+    DETACH DELETE n
+"#;
+
+/// Delete one Episodic node by uuid (R5, `EpisodicNode.delete` Neo4j branch):
+/// `MATCH (n:Episodic {uuid}) DETACH DELETE n`.
+pub const DELETE_EPISODE: &str = r#"
+    MATCH (n:Episodic {uuid: $uuid})
+    DETACH DELETE n
+"#;
+
+/// Saga-node RETURN clause (verbatim `SAGA_NODE_RETURN`, alias `s`).
+pub const SAGA_NODE_RETURN: &str = r#"
+    s.uuid AS uuid,
+    s.name AS name,
+    s.group_id AS group_id,
+    s.created_at AS created_at,
+    s.summary AS summary,
+    s.first_episode_uuid AS first_episode_uuid,
+    s.last_episode_uuid AS last_episode_uuid,
+    s.last_summarized_at AS last_summarized_at,
+    s.last_summarized_episode_valid_at AS last_summarized_episode_valid_at
+"#;
+
+/// Save a saga node (verbatim `get_saga_node_save_query`, Neo4j branch). We pass
+/// scalar props as named params (the node has no embedding).
+pub const SAVE_SAGA_NODE: &str = r#"
+    MERGE (n:Saga {uuid: $uuid})
+    SET n = {uuid: $uuid, name: $name, group_id: $group_id, created_at: $created_at, summary: $summary, first_episode_uuid: $first_episode_uuid, last_episode_uuid: $last_episode_uuid, last_summarized_at: $last_summarized_at, last_summarized_episode_valid_at: $last_summarized_episode_valid_at}
+    RETURN n.uuid AS uuid
+"#;
+
+/// Save a HAS_EPISODE edge (verbatim `HAS_EPISODE_EDGE_SAVE`).
+pub const SAVE_HAS_EPISODE_EDGE: &str = r#"
+    MATCH (saga:Saga {uuid: $saga_uuid})
+    MATCH (episode:Episodic {uuid: $episode_uuid})
+    MERGE (saga)-[e:HAS_EPISODE {uuid: $uuid}]->(episode)
+    SET
+        e.group_id = $group_id,
+        e.created_at = $created_at
+    RETURN e.uuid AS uuid
+"#;
+
+/// Save a NEXT_EPISODE edge (verbatim `NEXT_EPISODE_EDGE_SAVE`).
+pub const SAVE_NEXT_EPISODE_EDGE: &str = r#"
+    MATCH (source_episode:Episodic {uuid: $source_episode_uuid})
+    MATCH (target_episode:Episodic {uuid: $target_episode_uuid})
+    MERGE (source_episode)-[e:NEXT_EPISODE {uuid: $uuid}]->(target_episode)
+    SET
+        e.group_id = $group_id,
+        e.created_at = $created_at
+    RETURN e.uuid AS uuid
+"#;
+
+/// Get-or-create saga lookup by (name, group_id) (R9 `get_or_create_saga`):
+/// `MATCH (s:Saga {name, group_id}) RETURN <saga>`.
+pub const GET_SAGA_BY_NAME: &str = r#"
+    MATCH (s:Saga {name: $name, group_id: $group_id})
+    RETURN
+"#;
+
+/// Previous-episode-in-saga (R9 `_saga_get_previous_episode_uuid`):
+/// `MATCH (s:Saga {uuid})-[:HAS_EPISODE]->(e:Episodic) WHERE e.uuid <> $current
+///  RETURN e.uuid AS uuid ORDER BY e.valid_at DESC, e.created_at DESC LIMIT 1`.
+pub const SAGA_PREVIOUS_EPISODE_UUID: &str = r#"
+    MATCH (s:Saga {uuid: $saga_uuid})-[:HAS_EPISODE]->(e:Episodic)
+    WHERE e.uuid <> $current_episode_uuid
+    RETURN e.uuid AS uuid
+    ORDER BY e.valid_at DESC, e.created_at DESC
+    LIMIT 1
+"#;
+
+/// Saga episode contents SINCE a watermark (R9 `summarize_saga` filtered fetch):
+/// `... WHERE e.created_at > $since RETURN e.content, e.valid_at ORDER BY
+/// e.valid_at ASC, e.created_at ASC LIMIT $limit`. Chronological order.
+pub const SAGA_EPISODE_CONTENTS_SINCE: &str = r#"
+    MATCH (s:Saga {uuid: $saga_uuid})-[:HAS_EPISODE]->(e:Episodic)
+    WHERE e.created_at > $since
+    RETURN e.content AS content, e.valid_at AS valid_at
+    ORDER BY e.valid_at ASC, e.created_at ASC
+    LIMIT $limit
+"#;
+
+/// Saga episode contents (no watermark) (R9): the LATEST `limit` episodes.
+/// Verbatim upstream: `ORDER BY e.valid_at DESC, e.created_at DESC LIMIT $limit`,
+/// then `reversed()` in Python to chronological order. The Rust caller reverses
+/// the rows after fetch, so the LIMIT keeps the most-recent episodes (matching
+/// upstream) while the returned order is chronological.
+pub const SAGA_EPISODE_CONTENTS_ALL: &str = r#"
+    MATCH (s:Saga {uuid: $saga_uuid})-[:HAS_EPISODE]->(e:Episodic)
+    RETURN e.content AS content, e.valid_at AS valid_at
+    ORDER BY e.valid_at DESC, e.created_at DESC
+    LIMIT $limit
+"#;
+
+// =====================================================================
 // LUCENE FULLTEXT QUERY BUILDER
 // =====================================================================
 

@@ -10,7 +10,10 @@ use chrono::{DateTime, Utc};
 use thiserror::Error;
 
 use crate::search::filters::SearchFilters;
-use crate::types::{EntityEdge, EntityNode, EpisodeType, EpisodicEdge, EpisodicNode};
+use crate::types::{
+    CommunityEdge, CommunityNode, EntityEdge, EntityNode, EpisodeType, EpisodicEdge, EpisodicNode,
+    HasEpisodeEdge, NextEpisodeEdge, SagaNode,
+};
 
 #[derive(Debug, Error)]
 pub enum DriverError {
@@ -32,6 +35,27 @@ pub trait EntityNodeOps: Send + Sync {
         &self,
         uuids: &[String],
     ) -> Result<Vec<EntityNode>, DriverError>;
+
+    /// Entity nodes scoped to the given `group_ids` (upstream
+    /// `EntityNode.get_by_group_ids`, Neo4j branch). Empty `group_ids` returns
+    /// empty. Used by community-cluster projection (plan R2).
+    async fn get_entity_nodes_by_group_ids(
+        &self,
+        group_ids: &[String],
+    ) -> Result<Vec<EntityNode>, DriverError>;
+
+    /// Entity nodes `MENTIONS`-targeted by any of the given episodes (upstream
+    /// `get_mentioned_nodes`, plan R5/R10):
+    /// `MATCH (episode:Episodic)-[:MENTIONS]->(n:Entity) WHERE episode.uuid IN
+    /// $uuids RETURN DISTINCT ...`. Empty `episode_uuids` returns empty.
+    async fn get_mentioned_nodes(
+        &self,
+        episode_uuids: &[String],
+    ) -> Result<Vec<EntityNode>, DriverError>;
+
+    /// `DETACH DELETE` Entity nodes by UUID (upstream `Node.delete_by_uuids`,
+    /// plan R5 cascade). Empty `uuids` is a no-op.
+    async fn delete_entity_nodes_by_uuids(&self, uuids: &[String]) -> Result<(), DriverError>;
 }
 
 #[async_trait]
@@ -49,6 +73,19 @@ pub trait EntityEdgeOps: Send + Sync {
         source_uuid: &str,
         target_uuid: &str,
     ) -> Result<Vec<EntityEdge>, DriverError>;
+
+    /// Entity edges by UUID (upstream `EntityEdge.get_by_uuids`, Neo4j branch):
+    /// `MATCH (n:Entity)-[e:RELATES_TO]->(m:Entity) WHERE e.uuid IN $uuids
+    /// RETURN ...`. Used by `remove_episode` (plan R5) and
+    /// `get_nodes_and_edges_by_episode` (plan R10). Empty `uuids` returns empty.
+    async fn get_entity_edges_by_uuids(
+        &self,
+        uuids: &[String],
+    ) -> Result<Vec<EntityEdge>, DriverError>;
+
+    /// `DELETE` `RELATES_TO` edges by UUID (upstream `Edge.delete_by_uuids`,
+    /// plan R5 cascade). Empty `uuids` is a no-op.
+    async fn delete_entity_edges_by_uuids(&self, uuids: &[String]) -> Result<(), DriverError>;
 }
 
 #[async_trait]
@@ -69,6 +106,10 @@ pub trait EpisodeOps: Send + Sync {
         group_ids: &[String],
         source: Option<EpisodeType>,
     ) -> Result<Vec<EpisodicNode>, DriverError>;
+
+    /// `DETACH DELETE` a single Episodic node by UUID (upstream
+    /// `EpisodicNode.delete`, plan R5 cascade). Missing uuid is a no-op.
+    async fn delete_episode(&self, uuid: &str) -> Result<(), DriverError>;
 }
 
 #[async_trait]
@@ -208,6 +249,180 @@ pub trait SearchOps: Send + Sync {
     ) -> Result<HashMap<String, u64>, DriverError>;
 }
 
+/// One entity neighbour in a community-cluster projection row (plan R2).
+///
+/// Mirrors upstream `Neighbor` (community_operations.py): a neighbour entity
+/// UUID and the count of `RELATES_TO` edges connecting it to the projected node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Neighbor {
+    pub node_uuid: String,
+    pub edge_count: u64,
+}
+
+/// The per-node adjacency projection for one node in a group (plan R2).
+///
+/// `node_uuid` is the projected Entity node; `neighbors` is its `RELATES_TO`
+/// adjacency with edge counts (upstream `projection[node.uuid] = [Neighbor...]`).
+#[derive(Debug, Clone)]
+pub struct NodeNeighbors {
+    pub node_uuid: String,
+    pub neighbors: Vec<Neighbor>,
+}
+
+/// One group's complete cluster projection (plan R2).
+///
+/// `group_id` + the full per-node adjacency list. `label_propagation` (Task 3)
+/// consumes the `nodes` list to assign each node an integer community and groups
+/// by the converged label. Keeping the projection grouped by `group_id` mirrors
+/// upstream `get_community_clusters`, which iterates groups and runs label
+/// propagation independently per group.
+#[derive(Debug, Clone)]
+pub struct GroupClusterProjection {
+    pub group_id: String,
+    pub nodes: Vec<NodeNeighbors>,
+}
+
+/// Community persistence + search + membership primitives (plan R1/R2/R3/R4/R8).
+///
+/// Ported from `graphiti_core/utils/maintenance/community_operations.py` and the
+/// community branches of `graphiti_core/search/search_utils.py` @ 34f56e65, plus
+/// `node_db_queries.py` / `edge_db_queries.py` community save/return queries.
+#[async_trait]
+pub trait CommunityOps: Send + Sync {
+    /// Upsert community nodes (upstream `get_community_node_save_query`, Neo4j
+    /// branch — MERGE by uuid, SET scalar props, set `name_embedding` vector).
+    async fn save_community_nodes(&self, nodes: &[CommunityNode]) -> Result<(), DriverError>;
+
+    /// Upsert HAS_MEMBER edges (upstream `get_community_edge_save_query`, Neo4j
+    /// branch — `MATCH (community:Community) MATCH (node:Entity|Community) MERGE
+    /// (community)-[e:HAS_MEMBER {uuid}]->(node)`).
+    async fn save_community_edges(&self, edges: &[CommunityEdge]) -> Result<(), DriverError>;
+
+    /// Community nodes scoped to `group_ids` (upstream
+    /// `CommunityNode.get_by_group_ids`). Empty `group_ids` returns empty.
+    async fn get_community_nodes_by_group_ids(
+        &self,
+        group_ids: &[String],
+    ) -> Result<Vec<CommunityNode>, DriverError>;
+
+    /// Community nodes by UUID (upstream `CommunityNode.get_by_uuids`). Empty
+    /// `uuids` returns empty.
+    async fn get_community_nodes_by_uuids(
+        &self,
+        uuids: &[String],
+    ) -> Result<Vec<CommunityNode>, DriverError>;
+
+    /// Fulltext (BM25) community search (plan R8 `community_fulltext_search`,
+    /// `community_name` index, group filter, ORDER BY score DESC LIMIT). Empty
+    /// query short-circuits to empty.
+    async fn community_fulltext_search(
+        &self,
+        query: &str,
+        group_ids: &[String],
+        limit: usize,
+    ) -> Result<Vec<CommunityNode>, DriverError>;
+
+    /// Cosine similarity community search over `name_embedding` (plan R8
+    /// `community_similarity_search`, `score > min_score`, ORDER BY score DESC
+    /// LIMIT).
+    async fn community_similarity_search(
+        &self,
+        search_vector: &[f32],
+        group_ids: &[String],
+        limit: usize,
+        min_score: f32,
+    ) -> Result<Vec<CommunityNode>, DriverError>;
+
+    /// Load `name_embedding` vectors for the given Community UUIDs (plan R8
+    /// `get_embeddings_for_communities`, MMR reranker support). UUIDs without a
+    /// stored embedding are omitted.
+    async fn get_embeddings_for_communities(
+        &self,
+        uuids: &[String],
+    ) -> Result<HashMap<String, Vec<f32>>, DriverError>;
+
+    /// `DETACH DELETE` all Community nodes in scope (plan R3 `remove_communities`:
+    /// `MATCH (c:Community) DETACH DELETE c`). Always full-graph (no group scope)
+    /// per upstream.
+    async fn remove_communities(&self) -> Result<(), DriverError>;
+
+    /// Per-group entity adjacency projection driving label propagation (plan R2
+    /// `get_community_clusters`). For each `group_id` (or all distinct entity
+    /// group_ids when `group_ids` is empty), returns each node's `RELATES_TO`
+    /// neighbour list with per-neighbour edge counts.
+    async fn get_community_clusters(
+        &self,
+        group_ids: &[String],
+    ) -> Result<Vec<GroupClusterProjection>, DriverError>;
+
+    /// Already-member lookup (plan R4 `determine_entity_community` step a):
+    /// `MATCH (c:Community)-[:HAS_MEMBER]->(n:Entity {uuid}) RETURN <community>`.
+    /// Returns the first community the entity already belongs to, if any.
+    async fn community_of_member(
+        &self,
+        entity_uuid: &str,
+    ) -> Result<Option<CommunityNode>, DriverError>;
+
+    /// Neighbour-vote lookup (plan R4 `determine_entity_community` step b):
+    /// `MATCH (c:Community)-[:HAS_MEMBER]->(m:Entity)-[:RELATES_TO]-(n:Entity
+    /// {uuid}) RETURN <community>`. Returns ONE row per neighbour's community
+    /// (NOT deduplicated); the caller (Task 3) does the mode/plurality count.
+    async fn neighbor_communities(
+        &self,
+        entity_uuid: &str,
+    ) -> Result<Vec<CommunityNode>, DriverError>;
+}
+
+/// Saga narrative-thread persistence + threading queries (plan R9).
+///
+/// Ported from `graphiti_core/graphiti.py` saga helpers (`get_or_create_saga`,
+/// `_saga_get_previous_episode_uuid`, `_saga_get_episode_contents`) and the saga
+/// save/return queries in `node_db_queries.py` / `edge_db_queries.py` @ 34f56e65.
+#[async_trait]
+pub trait SagaOps: Send + Sync {
+    /// Upsert a saga node (upstream `get_saga_node_save_query`, Neo4j branch).
+    async fn save_saga_node(&self, node: &SagaNode) -> Result<(), DriverError>;
+
+    /// Upsert a HAS_EPISODE edge Saga→Episodic (upstream `HAS_EPISODE_EDGE_SAVE`).
+    async fn save_has_episode_edge(&self, edge: &HasEpisodeEdge) -> Result<(), DriverError>;
+
+    /// Upsert a NEXT_EPISODE edge Episodic→Episodic (upstream
+    /// `NEXT_EPISODE_EDGE_SAVE`).
+    async fn save_next_episode_edge(&self, edge: &NextEpisodeEdge) -> Result<(), DriverError>;
+
+    /// Get-or-create lookup by `(name, group_id)` (plan R9 `get_or_create_saga`):
+    /// `MATCH (s:Saga {name, group_id}) RETURN ...`. Returns the existing saga
+    /// when present; creation is the caller's responsibility (this is the lookup
+    /// half only).
+    async fn get_saga_by_name(
+        &self,
+        name: &str,
+        group_id: &str,
+    ) -> Result<Option<SagaNode>, DriverError>;
+
+    /// Most-recent prior episode in a saga (plan R9 `_saga_get_previous_episode_uuid`):
+    /// `MATCH (s:Saga {uuid})-[:HAS_EPISODE]->(e:Episodic) WHERE e.uuid <>
+    /// $current ORDER BY e.valid_at DESC, e.created_at DESC LIMIT 1`. Returns the
+    /// previous episode UUID for chaining the NEXT_EPISODE edge.
+    async fn saga_previous_episode_uuid(
+        &self,
+        saga_uuid: &str,
+        current_episode_uuid: &str,
+    ) -> Result<Option<String>, DriverError>;
+
+    /// `(content, valid_at)` per saga episode for summarization (plan R9
+    /// `_saga_get_episode_contents` / `summarize_saga` fetch). When `since` is
+    /// `Some`, filters `e.created_at > $since` and returns chronological
+    /// (`valid_at ASC`); when `None`, returns all (chronological). `limit` caps
+    /// the row count.
+    async fn saga_episode_contents(
+        &self,
+        saga_uuid: &str,
+        since: Option<DateTime<Utc>>,
+        limit: usize,
+    ) -> Result<Vec<(String, DateTime<Utc>)>, DriverError>;
+}
+
 #[async_trait]
 pub trait SchemaOps: Send + Sync {
     async fn build_indices_and_constraints(&self, delete_existing: bool)
@@ -216,7 +431,14 @@ pub trait SchemaOps: Send + Sync {
 
 /// Composite storage backend contract (upstream GraphDriver, operation-level).
 pub trait GraphDriver:
-    EntityNodeOps + EntityEdgeOps + EpisodeOps + EpisodicEdgeOps + SearchOps + SchemaOps
+    EntityNodeOps
+    + EntityEdgeOps
+    + EpisodeOps
+    + EpisodicEdgeOps
+    + SearchOps
+    + CommunityOps
+    + SagaOps
+    + SchemaOps
 {
     fn provider(&self) -> &'static str;
 }
@@ -244,6 +466,24 @@ mod tests {
         ) -> Result<Vec<EntityNode>, DriverError> {
             Ok(vec![])
         }
+
+        async fn get_entity_nodes_by_group_ids(
+            &self,
+            _group_ids: &[String],
+        ) -> Result<Vec<EntityNode>, DriverError> {
+            Ok(vec![])
+        }
+
+        async fn get_mentioned_nodes(
+            &self,
+            _episode_uuids: &[String],
+        ) -> Result<Vec<EntityNode>, DriverError> {
+            Ok(vec![])
+        }
+
+        async fn delete_entity_nodes_by_uuids(&self, _uuids: &[String]) -> Result<(), DriverError> {
+            Ok(())
+        }
     }
 
     #[async_trait]
@@ -262,6 +502,17 @@ mod tests {
             _target_uuid: &str,
         ) -> Result<Vec<EntityEdge>, DriverError> {
             Ok(vec![])
+        }
+
+        async fn get_entity_edges_by_uuids(
+            &self,
+            _uuids: &[String],
+        ) -> Result<Vec<EntityEdge>, DriverError> {
+            Ok(vec![])
+        }
+
+        async fn delete_entity_edges_by_uuids(&self, _uuids: &[String]) -> Result<(), DriverError> {
+            Ok(())
         }
     }
 
@@ -290,6 +541,10 @@ mod tests {
             _source: Option<EpisodeType>,
         ) -> Result<Vec<EpisodicNode>, DriverError> {
             Ok(vec![])
+        }
+
+        async fn delete_episode(&self, _uuid: &str) -> Result<(), DriverError> {
+            Ok(())
         }
     }
 
@@ -402,6 +657,122 @@ mod tests {
             _node_uuids: &[String],
         ) -> Result<HashMap<String, u64>, DriverError> {
             Ok(HashMap::new())
+        }
+    }
+
+    #[async_trait]
+    impl CommunityOps for NullDriver {
+        async fn save_community_nodes(&self, _nodes: &[CommunityNode]) -> Result<(), DriverError> {
+            Ok(())
+        }
+
+        async fn save_community_edges(&self, _edges: &[CommunityEdge]) -> Result<(), DriverError> {
+            Ok(())
+        }
+
+        async fn get_community_nodes_by_group_ids(
+            &self,
+            _group_ids: &[String],
+        ) -> Result<Vec<CommunityNode>, DriverError> {
+            Ok(vec![])
+        }
+
+        async fn get_community_nodes_by_uuids(
+            &self,
+            _uuids: &[String],
+        ) -> Result<Vec<CommunityNode>, DriverError> {
+            Ok(vec![])
+        }
+
+        async fn community_fulltext_search(
+            &self,
+            _query: &str,
+            _group_ids: &[String],
+            _limit: usize,
+        ) -> Result<Vec<CommunityNode>, DriverError> {
+            Ok(vec![])
+        }
+
+        async fn community_similarity_search(
+            &self,
+            _search_vector: &[f32],
+            _group_ids: &[String],
+            _limit: usize,
+            _min_score: f32,
+        ) -> Result<Vec<CommunityNode>, DriverError> {
+            Ok(vec![])
+        }
+
+        async fn get_embeddings_for_communities(
+            &self,
+            _uuids: &[String],
+        ) -> Result<HashMap<String, Vec<f32>>, DriverError> {
+            Ok(HashMap::new())
+        }
+
+        async fn remove_communities(&self) -> Result<(), DriverError> {
+            Ok(())
+        }
+
+        async fn get_community_clusters(
+            &self,
+            _group_ids: &[String],
+        ) -> Result<Vec<GroupClusterProjection>, DriverError> {
+            Ok(vec![])
+        }
+
+        async fn community_of_member(
+            &self,
+            _entity_uuid: &str,
+        ) -> Result<Option<CommunityNode>, DriverError> {
+            Ok(None)
+        }
+
+        async fn neighbor_communities(
+            &self,
+            _entity_uuid: &str,
+        ) -> Result<Vec<CommunityNode>, DriverError> {
+            Ok(vec![])
+        }
+    }
+
+    #[async_trait]
+    impl SagaOps for NullDriver {
+        async fn save_saga_node(&self, _node: &SagaNode) -> Result<(), DriverError> {
+            Ok(())
+        }
+
+        async fn save_has_episode_edge(&self, _edge: &HasEpisodeEdge) -> Result<(), DriverError> {
+            Ok(())
+        }
+
+        async fn save_next_episode_edge(&self, _edge: &NextEpisodeEdge) -> Result<(), DriverError> {
+            Ok(())
+        }
+
+        async fn get_saga_by_name(
+            &self,
+            _name: &str,
+            _group_id: &str,
+        ) -> Result<Option<SagaNode>, DriverError> {
+            Ok(None)
+        }
+
+        async fn saga_previous_episode_uuid(
+            &self,
+            _saga_uuid: &str,
+            _current_episode_uuid: &str,
+        ) -> Result<Option<String>, DriverError> {
+            Ok(None)
+        }
+
+        async fn saga_episode_contents(
+            &self,
+            _saga_uuid: &str,
+            _since: Option<DateTime<Utc>>,
+            _limit: usize,
+        ) -> Result<Vec<(String, DateTime<Utc>)>, DriverError> {
+            Ok(vec![])
         }
     }
 

@@ -12,10 +12,14 @@
 //! ```
 
 use chronicle_core::driver::{
-    EntityEdgeOps, EntityNodeOps, EpisodeOps, EpisodicEdgeOps, GraphDriver, SchemaOps, SearchOps,
+    CommunityOps, EntityEdgeOps, EntityNodeOps, EpisodeOps, EpisodicEdgeOps, GraphDriver, SagaOps,
+    SchemaOps, SearchOps,
 };
 use chronicle_core::search::filters::SearchFilters;
-use chronicle_core::types::{EntityEdge, EntityNode, EpisodeType, EpisodicEdge, EpisodicNode};
+use chronicle_core::types::{
+    CommunityEdge, CommunityNode, EntityEdge, EntityNode, EpisodeType, EpisodicEdge, EpisodicNode,
+    HasEpisodeEdge, NextEpisodeEdge, SagaNode,
+};
 use chronicle_driver_neo4j::Neo4jDriver;
 use chrono::{Duration, Utc};
 use serde_json::json;
@@ -956,6 +960,311 @@ async fn filtered_edge_search_combo() {
         !set2.contains(&plain_edge.uuid),
         "unlabelled endpoints excluded by node_labels"
     );
+
+    cleanup(&d, &group).await;
+}
+
+// =====================================================================
+// Phase-4: community + saga + maintenance ops (env-gated; skip w/o DB)
+// =====================================================================
+
+macro_rules! skip_without_db {
+    () => {{
+        match test_driver().await {
+            Some(d) => d,
+            None => {
+                eprintln!("skipping: NEO4J_TEST_URI unset");
+                return;
+            }
+        }
+    }};
+}
+
+#[tokio::test]
+async fn community_node_and_edge_roundtrip() {
+    let d = skip_without_db!();
+    d.build_indices_and_constraints(false).await.expect("build");
+    let group = unique_group();
+
+    // An entity to be a HAS_MEMBER target.
+    let mut entity = EntityNode::new("Member".into(), group.clone(), Utc::now());
+    entity.name_embedding = Some(vec![0.1; 8]);
+    d.save_entity_nodes(std::slice::from_ref(&entity))
+        .await
+        .expect("save entity");
+
+    let mut community = CommunityNode::new("Tech Cluster".into(), group.clone(), Utc::now());
+    community.summary = "tech firms".into();
+    community.name_embedding = Some(vec![0.2; 8]);
+    d.save_community_nodes(std::slice::from_ref(&community))
+        .await
+        .expect("save community");
+
+    let edge = CommunityEdge::new(
+        community.uuid.clone(),
+        entity.uuid.clone(),
+        group.clone(),
+        Utc::now(),
+    );
+    d.save_community_edges(std::slice::from_ref(&edge))
+        .await
+        .expect("save community edge");
+
+    let by_group = d
+        .get_community_nodes_by_group_ids(std::slice::from_ref(&group))
+        .await
+        .expect("by group");
+    assert_eq!(by_group.len(), 1);
+    assert_eq!(by_group[0].uuid, community.uuid);
+    assert_eq!(by_group[0].summary, "tech firms");
+
+    let by_uuid = d
+        .get_community_nodes_by_uuids(&[community.uuid.clone()])
+        .await
+        .expect("by uuid");
+    assert_eq!(by_uuid.len(), 1);
+
+    // membership already-member
+    let mem = d
+        .community_of_member(&entity.uuid)
+        .await
+        .expect("member lookup");
+    assert_eq!(mem.map(|c| c.uuid), Some(community.uuid.clone()));
+
+    // embeddings loader
+    let emb = d
+        .get_embeddings_for_communities(&[community.uuid.clone()])
+        .await
+        .expect("embeddings");
+    assert!(emb.contains_key(&community.uuid));
+
+    cleanup(&d, &group).await;
+}
+
+#[tokio::test]
+async fn community_fulltext_and_similarity_search_live() {
+    let d = skip_without_db!();
+    d.build_indices_and_constraints(false).await.expect("build");
+    let group = unique_group();
+
+    let mut c1 = CommunityNode::new("Distinctcommunityalpha".into(), group.clone(), Utc::now());
+    c1.name_embedding = Some(vec![1.0, 0.0, 0.0, 0.0]);
+    let mut c2 = CommunityNode::new("Otherbeta".into(), group.clone(), Utc::now());
+    c2.name_embedding = Some(vec![0.0, 1.0, 0.0, 0.0]);
+    d.save_community_nodes(&[c1.clone(), c2.clone()])
+        .await
+        .expect("save");
+
+    let ft = d
+        .community_fulltext_search("distinctcommunityalpha", std::slice::from_ref(&group), 10)
+        .await
+        .expect("fulltext");
+    assert!(ft.iter().any(|c| c.uuid == c1.uuid));
+
+    let sim = d
+        .community_similarity_search(&[1.0, 0.0, 0.0, 0.0], std::slice::from_ref(&group), 10, 0.5)
+        .await
+        .expect("similarity");
+    assert_eq!(sim.first().map(|c| c.uuid.clone()), Some(c1.uuid.clone()));
+
+    cleanup(&d, &group).await;
+}
+
+#[tokio::test]
+async fn community_clusters_and_neighbor_vote_live() {
+    let d = skip_without_db!();
+    d.build_indices_and_constraints(false).await.expect("build");
+    let group = unique_group();
+
+    let a = EntityNode::new("A".into(), group.clone(), Utc::now());
+    let b = EntityNode::new("B".into(), group.clone(), Utc::now());
+    let x = EntityNode::new("X".into(), group.clone(), Utc::now());
+    d.save_entity_nodes(&[a.clone(), b.clone(), x.clone()])
+        .await
+        .expect("save nodes");
+
+    let mut ab = EntityEdge::new(
+        a.uuid.clone(),
+        b.uuid.clone(),
+        "REL".into(),
+        "a-b".into(),
+        group.clone(),
+    );
+    ab.fact_embedding = Some(vec![0.1; 8]);
+    let mut ax = EntityEdge::new(
+        a.uuid.clone(),
+        x.uuid.clone(),
+        "REL".into(),
+        "a-x".into(),
+        group.clone(),
+    );
+    ax.fact_embedding = Some(vec![0.1; 8]);
+    d.save_entity_edges(&[ab, ax]).await.expect("save edges");
+
+    let clusters = d
+        .get_community_clusters(std::slice::from_ref(&group))
+        .await
+        .expect("clusters");
+    assert_eq!(clusters.len(), 1);
+    let a_proj = clusters[0]
+        .nodes
+        .iter()
+        .find(|n| n.node_uuid == a.uuid)
+        .expect("a present");
+    assert!(a_proj.neighbors.iter().any(|n| n.node_uuid == b.uuid));
+    assert!(a_proj.neighbors.iter().any(|n| n.node_uuid == x.uuid));
+
+    // a belongs to a community; x is a neighbour → neighbour-vote row
+    let mut community = CommunityNode::new("C".into(), group.clone(), Utc::now());
+    community.name_embedding = Some(vec![0.3; 8]);
+    d.save_community_nodes(std::slice::from_ref(&community))
+        .await
+        .expect("save community");
+    d.save_community_edges(&[CommunityEdge::new(
+        community.uuid.clone(),
+        a.uuid.clone(),
+        group.clone(),
+        Utc::now(),
+    )])
+    .await
+    .expect("save member");
+
+    let votes = d.neighbor_communities(&x.uuid).await.expect("votes");
+    assert!(votes.iter().any(|c| c.uuid == community.uuid));
+
+    // remove_communities clears them
+    d.remove_communities().await.expect("remove");
+    let after = d
+        .get_community_nodes_by_group_ids(std::slice::from_ref(&group))
+        .await
+        .expect("after remove");
+    assert!(after.is_empty());
+
+    cleanup(&d, &group).await;
+}
+
+#[tokio::test]
+async fn saga_threading_and_contents_live() {
+    let d = skip_without_db!();
+    d.build_indices_and_constraints(false).await.expect("build");
+    let group = unique_group();
+
+    let v1 = Utc::now() - Duration::days(2);
+    let v2 = Utc::now() - Duration::days(1);
+    let mut e1 = EpisodicNode::new(
+        "ep1".into(),
+        group.clone(),
+        EpisodeType::Message,
+        "d".into(),
+        "first content".into(),
+        Utc::now(),
+        v1,
+    );
+    e1.uuid = uuid::Uuid::new_v4().to_string();
+    let mut e2 = EpisodicNode::new(
+        "ep2".into(),
+        group.clone(),
+        EpisodeType::Message,
+        "d".into(),
+        "second content".into(),
+        Utc::now(),
+        v2,
+    );
+    e2.uuid = uuid::Uuid::new_v4().to_string();
+    d.save_episode(&e1).await.expect("save e1");
+    d.save_episode(&e2).await.expect("save e2");
+
+    let saga = SagaNode::new("my-saga".into(), group.clone(), Utc::now());
+    d.save_saga_node(&saga).await.expect("save saga");
+
+    // get_or_create lookup finds it
+    let found = d
+        .get_saga_by_name("my-saga", &group)
+        .await
+        .expect("get saga");
+    assert_eq!(found.map(|s| s.uuid), Some(saga.uuid.clone()));
+
+    for ep in [&e1, &e2] {
+        d.save_has_episode_edge(&HasEpisodeEdge::new(
+            saga.uuid.clone(),
+            ep.uuid.clone(),
+            group.clone(),
+            Utc::now(),
+        ))
+        .await
+        .expect("has_episode");
+    }
+    d.save_next_episode_edge(&NextEpisodeEdge::new(
+        e1.uuid.clone(),
+        e2.uuid.clone(),
+        group.clone(),
+        Utc::now(),
+    ))
+    .await
+    .expect("next_episode");
+
+    // previous episode for e2 = e1
+    let prev = d
+        .saga_previous_episode_uuid(&saga.uuid, &e2.uuid)
+        .await
+        .expect("prev");
+    assert_eq!(prev, Some(e1.uuid.clone()));
+
+    // contents (no watermark) chronological
+    let contents = d
+        .saga_episode_contents(&saga.uuid, None, 200)
+        .await
+        .expect("contents");
+    assert_eq!(contents.len(), 2);
+    assert_eq!(contents[0].0, "first content");
+    assert_eq!(contents[1].0, "second content");
+
+    cleanup(&d, &group).await;
+}
+
+#[tokio::test]
+async fn mentioned_nodes_and_cascade_deletes_live() {
+    let d = skip_without_db!();
+    d.build_indices_and_constraints(false).await.expect("build");
+    let group = unique_group();
+
+    let n1 = EntityNode::new("N1".into(), group.clone(), Utc::now());
+    d.save_entity_nodes(std::slice::from_ref(&n1))
+        .await
+        .expect("save node");
+    let mut ep = EpisodicNode::new(
+        "ep".into(),
+        group.clone(),
+        EpisodeType::Message,
+        "d".into(),
+        "content".into(),
+        Utc::now(),
+        Utc::now(),
+    );
+    ep.uuid = uuid::Uuid::new_v4().to_string();
+    d.save_episode(&ep).await.expect("save episode");
+    d.save_episodic_edges(&[EpisodicEdge::new(
+        ep.uuid.clone(),
+        n1.uuid.clone(),
+        group.clone(),
+        Utc::now(),
+    )])
+    .await
+    .expect("mention");
+
+    let mentioned = d
+        .get_mentioned_nodes(&[ep.uuid.clone()])
+        .await
+        .expect("mentioned");
+    assert!(mentioned.iter().any(|n| n.uuid == n1.uuid));
+
+    // delete cascade
+    d.delete_entity_nodes_by_uuids(std::slice::from_ref(&n1.uuid))
+        .await
+        .expect("del node");
+    assert!(d.get_entity_node(&n1.uuid).await.expect("get").is_none());
+    d.delete_episode(&ep.uuid).await.expect("del episode");
+    assert!(d.get_episode(&ep.uuid).await.expect("get ep").is_none());
 
     cleanup(&d, &group).await;
 }

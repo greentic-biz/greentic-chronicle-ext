@@ -11,9 +11,13 @@ use crate::chronicle::{AddEpisodeRequest, AddEpisodeResults};
 use crate::errors::ChronicleError;
 use crate::helpers::{RELEVANT_SCHEMA_LIMIT, utc_now};
 use crate::pipeline::clients::Clients;
+use crate::pipeline::community_ops::update_community;
 use crate::pipeline::edge_ops::{extract_edges, hydrate_node_summaries, resolve_extracted_edges};
 use crate::pipeline::node_ops::{extract_nodes, resolve_extracted_nodes};
-use crate::types::{EntityEdge, EntityNode, EpisodicEdge, EpisodicNode};
+use crate::pipeline::saga::associate_episode_with_saga;
+use crate::types::{
+    CommunityEdge, CommunityNode, EntityEdge, EntityNode, EpisodicEdge, EpisodicNode,
+};
 
 /// Remap an edge's source/target node UUIDs through the node-resolution
 /// `uuid_map` (extracted → canonical). Port of upstream `resolve_edge_pointers`
@@ -147,12 +151,43 @@ pub async fn add_episode(
     clients.driver.save_entity_edges(&entity_edges).await?;
     clients.driver.save_episodic_edges(&episodic_edges).await?;
 
-    // 10. Result.
+    // 10. Saga association (upstream `_process_episode_data` saga block runs
+    //     immediately after the bulk save, before community updates).
+    if let Some(saga_name) = &req.saga {
+        associate_episode_with_saga(
+            clients,
+            saga_name,
+            &group_id,
+            &episode,
+            req.saga_previous_episode_uuid.as_deref(),
+            now,
+        )
+        .await?;
+    }
+
+    // 11. Community updates (upstream `if update_communities:` after
+    //     `_process_episode_data`). Runs `update_community` per final node,
+    //     accumulating the touched communities + HAS_MEMBER edges. Upstream
+    //     iterates the resolved `nodes`; we iterate `hydrated_nodes` (same set,
+    //     post-summary-hydration) so membership reflects the persisted state.
+    let mut communities: Vec<CommunityNode> = Vec::new();
+    let mut community_edges: Vec<CommunityEdge> = Vec::new();
+    if req.update_communities {
+        for node in &hydrated_nodes {
+            let (node_communities, node_edges) = update_community(clients, node).await?;
+            communities.extend(node_communities);
+            community_edges.extend(node_edges);
+        }
+    }
+
+    // 12. Result.
     Ok(AddEpisodeResults {
         episode,
         episodic_edges,
         nodes: hydrated_nodes,
         edges: entity_edges,
+        communities,
+        community_edges,
     })
 }
 

@@ -1218,6 +1218,12 @@ impl SagaOps for FakeDriver {
             .cloned())
     }
 
+    /// Saga by UUID (R9 `SagaNode.get_by_uuid`, used by `summarize_saga`).
+    async fn get_saga_by_uuid(&self, uuid: &str) -> Result<Option<SagaNode>, DriverError> {
+        let g = lock!(self)?;
+        Ok(g.saga_nodes.get(uuid).cloned())
+    }
+
     /// Most-recent prior episode in a saga (R9): of the saga's HAS_EPISODE
     /// episodes (excluding `current_episode_uuid`), the one with the greatest
     /// `valid_at` (then `created_at`) — mirrors `ORDER BY valid_at DESC,

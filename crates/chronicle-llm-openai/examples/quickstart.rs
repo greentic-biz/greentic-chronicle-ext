@@ -63,10 +63,7 @@ async fn main() -> anyhow::Result<()> {
             source_description: "quickstart example".into(),
             reference_time: chrono::Utc::now(),
             group_id: "quickstart".into(),
-            uuid: None,
-            previous_episode_uuids: None,
-            entity_types: None,
-            custom_extraction_instructions: None,
+            ..Default::default()
         })
         .await?;
 

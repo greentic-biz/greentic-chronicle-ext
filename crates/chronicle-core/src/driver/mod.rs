@@ -400,6 +400,12 @@ pub trait SagaOps: Send + Sync {
         group_id: &str,
     ) -> Result<Option<SagaNode>, DriverError>;
 
+    /// Saga by UUID (upstream `SagaNode.get_by_uuid`, used by `summarize_saga`):
+    /// `MATCH (s:Saga {uuid}) RETURN <saga>`. Returns `None` when absent — the
+    /// caller (`pipeline::saga::summarize_saga`) maps that to
+    /// [`crate::errors::ChronicleError::NodeNotFound`].
+    async fn get_saga_by_uuid(&self, uuid: &str) -> Result<Option<SagaNode>, DriverError>;
+
     /// Most-recent prior episode in a saga (plan R9 `_saga_get_previous_episode_uuid`):
     /// `MATCH (s:Saga {uuid})-[:HAS_EPISODE]->(e:Episodic) WHERE e.uuid <>
     /// $current ORDER BY e.valid_at DESC, e.created_at DESC LIMIT 1`. Returns the
@@ -755,6 +761,10 @@ mod tests {
             _name: &str,
             _group_id: &str,
         ) -> Result<Option<SagaNode>, DriverError> {
+            Ok(None)
+        }
+
+        async fn get_saga_by_uuid(&self, _uuid: &str) -> Result<Option<SagaNode>, DriverError> {
             Ok(None)
         }
 

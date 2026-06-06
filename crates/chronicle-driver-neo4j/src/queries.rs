@@ -1126,6 +1126,13 @@ pub const GET_SAGA_BY_NAME: &str = r#"
     RETURN
 "#;
 
+/// Saga lookup by UUID (R9 `SagaNode.get_by_uuid`, used by `summarize_saga`):
+/// `MATCH (s:Saga {uuid}) RETURN <saga>`.
+pub const GET_SAGA_BY_UUID: &str = r#"
+    MATCH (s:Saga {uuid: $uuid})
+    RETURN
+"#;
+
 /// Previous-episode-in-saga (R9 `_saga_get_previous_episode_uuid`):
 /// `MATCH (s:Saga {uuid})-[:HAS_EPISODE]->(e:Episodic) WHERE e.uuid <> $current
 ///  RETURN e.uuid AS uuid ORDER BY e.valid_at DESC, e.created_at DESC LIMIT 1`.

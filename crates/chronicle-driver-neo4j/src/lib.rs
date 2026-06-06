@@ -1059,6 +1059,18 @@ impl SagaOps for Neo4jDriver {
         }
     }
 
+    async fn get_saga_by_uuid(&self, uuid: &str) -> Result<Option<SagaNode>, DriverError> {
+        debug!(uuid, "neo4j get_saga_by_uuid");
+        let cypher = format!("{}{}", queries::GET_SAGA_BY_UUID, queries::SAGA_NODE_RETURN);
+        let rows = self
+            .fetch_rows(query(&cypher).param("uuid", uuid), "get_saga_by_uuid")
+            .await?;
+        match rows.first() {
+            Some(row) => Ok(Some(convert::saga_node_from_row(row)?)),
+            None => Ok(None),
+        }
+    }
+
     async fn saga_previous_episode_uuid(
         &self,
         saga_uuid: &str,

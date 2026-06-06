@@ -6,6 +6,7 @@ members = [
     "crates/chronicle-testkit",
     "crates/chronicle-driver-neo4j",
     "crates/chronicle-driver-surreal",
+    "crates/chronicle-driver-falkor",
     "crates/chronicle-llm-openai",
 ]
 
@@ -21,6 +22,7 @@ chronicle-core = { path = "crates/chronicle-core" }
 chronicle-testkit = { path = "crates/chronicle-testkit" }
 chronicle-driver-neo4j = { path = "crates/chronicle-driver-neo4j" }
 chronicle-driver-surreal = { path = "crates/chronicle-driver-surreal" }
+chronicle-driver-falkor = { path = "crates/chronicle-driver-falkor" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
@@ -34,6 +36,7 @@ tracing = "0.1"
 rand = "0.9"
 futures = "0.3"
 neo4rs = "0.8"
+falkordb = { version = "0.2", features = ["tokio"] }
 surrealdb = { version = "3", default-features = false, features = [
     "kv-rocksdb",
     "kv-mem",

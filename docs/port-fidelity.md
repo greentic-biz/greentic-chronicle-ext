@@ -70,6 +70,10 @@ Statuses:
 | `crates/chronicle-driver-surreal/src/lib.rs` (bulk + maintenance) | `bulk_utils.py` + `community_operations.py` + saga helpers | adapted | `BulkSaveOps::save_all` atomic transaction via the `db.begin()`/`tx.commit()`/`tx.cancel()` handle API (rollback on first statement error — D-5 parity); `get_community_clusters` aggregation; `community_of_member`/`neighbor_communities`; `detach_entities`/`detach_episode` (explicit edge-detach delete, no graph cascade — D-31); saga `get_by_name`/`previous_episode`/`episode_contents`. |
 | `crates/chronicle-driver-surreal/src/schema.rs` | `graphiti_core/driver/` index/constraint DDL | adapted | Idempotent SurrealQL DDL (`DEFINE … IF NOT EXISTS`/`OVERWRITE`): per-node-kind tables + `relates_to`/`mentions`/`has_member`/`has_episode`/`next_episode` RELATION tables; HNSW vector indexes `TYPE F32 DIST COSINE` (D-29); BM25 FTS analyzer + per-field SEARCH indexes; group_id indexes. `build_indices_and_constraints` re-runs DDL idempotently. |
 | `crates/chronicle-driver-surreal/src/convert.rs` | (SurrealDB ↔ domain type conversions, no direct upstream equivalent) | adapted | `chrono::DateTime<Utc>` ↔ `surrealdb::types::Datetime` at the boundary (never bind chrono directly — D-30); `Vec<f32>` ↔ native `array<float>`; `serde_json::Value` attrs ↔ `object`. Row structs with Serialize/Deserialize; uuid↔record-id mapping. Datetime-is-datetime roundtrip guard test. |
+| `crates/chronicle-driver-falkor/src/lib.rs` (persistence + search + bulk/maintenance) | `graphiti_core/driver/neo4j/` (Cypher-dialect adaptation of the Neo4j driver) | adapted | Full `GraphDriver` supertrait over FalkorDB (`falkordb` 0.2.1, openCypher on a Redis module). Persistence via per-item `MERGE … SET`; search via `db.idx.vector.query*` (distance→similarity post-filter, over-fetch ×3 — D-33) + `db.idx.fulltext.query{Nodes,Relationships}` (relationship fulltext via DDL index — D-37); BFS `*1..N` with inline-clamped depth; `get_community_clusters` `count(e)` aggregation; saga threading by epoch-int ordering. `save_all` best-effort sequential (no atomic batch — D-34). Correctness oracle = behaviour parity (live integration + search suites + `falkor_e2e` gate). Deviations D-33–D-39. |
+| `crates/chronicle-driver-falkor/src/schema.rs` | `graphiti_core/driver/` index DDL | adapted | Idempotent FalkorDB DDL: range indices (uuid+group_id per label), HNSW vector indices (`CREATE VECTOR INDEX … OPTIONS {dimension, similarityFunction:'cosine'}`, node + relationship forms), node fulltext (`db.idx.fulltext.createNodeIndex`), relationship fulltext (`CREATE FULLTEXT INDEX FOR ()-[r:RELATES_TO]-() ON (r.fact)` — D-37). `already_exists` swallows the no-`IF NOT EXISTS` re-create error class. |
+| `crates/chronicle-driver-falkor/src/convert.rs` | (FalkorDB ↔ domain type conversions, no direct upstream equivalent) | adapted | Cypher-literal encoders (`lit_str`/`lit_int`/`lit_string_list`/`lit_vecf32`/`lit_attrs`) — every dynamic value escaped, no raw interpolation (D-38); datetime ↔ epoch-millis `i64` (D-35); attrs ↔ JSON-string `attrs_json` (D-36); `FalkorValue` (`Node`/`Edge`/`Vec32`) extraction. |
+| `crates/chronicle-driver-falkor/src/filters.rs` | `graphiti_core/search/search_filters.py` | adapted | `SearchFilters` → Cypher WHERE fragments (edge_types / edge_uuids / node_labels / date OR-of-ANDs as epoch-int comparisons), rendered as escaped literals; threaded into all base searches + BFS. |
 | `crates/chronicle-llm-openai/src/llm.rs` | `graphiti_core/llm_client/openai_generic_client.py`, `openai_base_client.py` | deviation | `DEFAULT_MODEL="gpt-4.1-mini"`, `DEFAULT_SMALL_MODEL="gpt-4.1-nano"`, temperature=0, max_tokens=16384 verbatim. `EmptyResponse` non-retryable (deviation #9). No error-context message appended on retry (deviation #9). RateLimit retried per base tenacity policy (deviation #9). |
 | `crates/chronicle-llm-openai/src/embedder.rs` | `graphiti_core/embedder/openai.py` | adapted | `OpenAiEmbedder`; `DEFAULT_EMBEDDING_MODEL="text-embedding-3-small"`. `EMBEDDING_DIM` is compile-time const (deviation #11). |
 | `crates/chronicle-testkit/src/fake_driver.rs` | (test fixture, no upstream equivalent) | adapted | In-memory `FakeDriver`; deterministic uuid tie-breaks in similarity sorts (deviation #13, test-only). Phase-4 `CommunityOps`/`SagaOps` in-memory; `BulkSaveOps` uses the default sequential `save_all` (no transaction needed — nothing can partially fail in memory). |
@@ -231,6 +235,58 @@ Node kinds are modelled as separate SurrealDB tables (`entity`/`episodic`/`commu
 
 ---
 
+## FalkorDB driver deviations (Phase 6)
+
+These are the locked implementation decisions for `chronicle-driver-falkor` (FalkorDB, the openCypher graph on a Redis module, `falkordb` 0.2.1, `features = ["tokio"]`). FalkorDB is a **Cypher-dialect adaptation of the Neo4j driver**, not a from-scratch query layer; the structural template is the Neo4j driver and the correctness oracle is **behaviour parity** with the FakeDriver/Neo4j/SurrealDB reference, proven by the live-server integration + search suites and the `falkor_e2e` gate (bi-temporal invalidation + community/saga/bulk/triplet/remove through the real driver). All deviations below are verified against live `falkordb/falkordb:latest`.
+
+The op groups and their FalkorDB realisation:
+
+| Op group | FalkorDB realisation |
+|---|---|
+| node/episode/community/saga persistence | `MERGE (n:Label {uuid}) SET …`, one statement per item (no nested-map params, no multi-statement batch) |
+| edge persistence (RELATES_TO/MENTIONS/HAS_MEMBER/HAS_EPISODE/NEXT_EPISODE) | `MATCH endpoints … MERGE (a)-[e:TYPE {uuid}]->(b) SET …` |
+| getters / by_uuids / by_group_ids | `MATCH … RETURN n/e`; `UNWIND <list> AS wanted MATCH {uuid: wanted}` for order-preserving by-uuid |
+| `retrieve_episodes` | epoch-int `valid_at <=` filter, `ORDER BY valid_at DESC LIMIT`, reversed to chronological |
+| vector search (node/edge/community) | `CALL db.idx.vector.query{Nodes,Relationships}(label,prop,K,vecf32([…]))`, over-fetch ×3, distance→similarity post-filter (D-33/D-36) |
+| fulltext search (node/episode/community) | `CALL db.idx.fulltext.queryNodes(label,$q) YIELD node, score` |
+| edge fulltext (`fact`) | `CALL db.idx.fulltext.queryRelationships('RELATES_TO',$q)` over a relationship-fulltext DDL index (D-37) |
+| BFS (node/edge) | `-[:RELATES_TO\|MENTIONS*1..N]->` with inline-clamped depth, edge re-MATCH by uuid for filters |
+| `get_community_clusters` | per-group, per-node `(n)-[e:RELATES_TO]-(m)` with `count(e)` aggregation → `GroupClusterProjection` |
+| `community_of_member` / `neighbor_communities` | `(c:Community)-[:HAS_MEMBER]->…`; neighbour query returns one row per membership (NOT deduped) |
+| deletes / `remove_communities` | `DETACH DELETE` for nodes (D-35), `DELETE e` for edges |
+| saga threading | `saga_previous_episode_uuid` / `saga_episode_contents` order by epoch-int `valid_at`/`created_at` |
+| `save_all` | best-effort sequential — no atomic batch (D-34) |
+
+### D-33: KNN distance score → similarity, min-score is a post-filter (over-fetch ×3)
+
+FalkorDB's `db.idx.vector.queryNodes`/`queryRelationships` procedures yield `(node/relationship, score)` where `score` is the cosine **distance** (smaller = closer), and they cannot post-filter inline on `min_score`, group, or node labels. The driver over-fetches `K = max(limit × 3, 30)` candidates ordered by distance ASC, converts each to a similarity (`1 - distance`), applies the group/label/filter WHERE in the query and the `similarity >= min_score` cut in Rust, then truncates to `limit`. Identical contract to the Neo4j inline `vector.similarity.cosine` path; verified by `node_similarity_ranks_and_applies_min_score` / `edge_similarity_ranks_and_cuts`.
+
+### D-34: `save_all` is best-effort sequential, NOT atomic
+
+FalkorDB's `GRAPH.QUERY` rejects `;`-separated multi-statement bodies and the `falkordb` 0.2 crate exposes no MULTI/EXEC transaction handle, so there is no way to wrap the four collection writes (episodes, entity nodes, entity edges, episodic edges) in a single atomic batch. Unlike the Neo4j backend — which OVERRIDES `save_all` with a real `start_txn → run all → commit` and rollback (D-5) — this backend performs the four writes **sequentially in the same order** with no cross-call rollback: a mid-batch failure leaves earlier collections persisted. This is an accepted FalkorDB limitation (the in-memory FakeDriver has the same non-atomic default, where nothing can partially fail). The ordering (nodes before edges) ensures a later failure cannot succeed-then-orphan. Exercised by the `add_episode_bulk_cross_dedup_falkor` e2e gate.
+
+### D-35: datetime stored as epoch-millis `i64` (no native datetime type)
+
+FalkorDB has no native datetime type. All temporal fields (`created_at`, `valid_at`, `expired_at`, `invalid_at`, the saga watermarks) are stored as **epoch-millisecond integers**; every bi-temporal comparison (`valid_at <=`, `created_at >`, ordering) becomes an integer comparison. `convert::datetime_to_millis`/`millis_to_datetime` are the only boundary. This is THE key delta a wrong mapping would silently break invalidation + retrieve-episodes cutoff; guarded by the `datetime_stored_as_int_and_filters_correctly` integration test and proven end-to-end by the `add_episode_two_episodes_invalidates_old_edge_and_keeps_it_falkor` gate (invalid_at round-trips to t1, edge stays retrievable).
+
+### D-36: attributes stored as a single JSON-string property (`attrs_json`)
+
+FalkorDB rejects nested-map properties ("Property values can only be of primitive types or arrays of primitive types"). The flat-or-nested `attributes` map is serialised to a single JSON **string** property `attrs_json` on write and parsed back on read, rather than stored as real node/edge properties (as the Neo4j backend does for flat attributes). Round-trip is lossless for any JSON-object attribute payload; the trade-off is that attribute values are not independently indexable/queryable on the server. Verified by the entity-node/edge attrs round-trip integration tests.
+
+### D-37: relationship fulltext via the DDL index form (not `createNodeIndex`)
+
+chronicle indexes the edge `fact` for fulltext recall. FalkorDB's `db.idx.fulltext.createNodeIndex` silently indexes nothing for a relationship type (verified empirically). The working path is the DDL form `CREATE FULLTEXT INDEX FOR ()-[r:RELATES_TO]-() ON (r.fact)`, queried with `db.idx.fulltext.queryRelationships('RELATES_TO', $q) YIELD relationship, score`. The driver re-MATCHes each yielded relationship by uuid so the endpoint aliases exist for the node-label / group / date filters. Verified by `edge_fulltext_recall_on_fact`.
+
+### D-38: parameters are textual Cypher literals (no typed wire params), encoded via an escaping layer
+
+The `falkordb` 0.2 crate binds parameters as `CYPHER key=<literal> <query>` — every parameter *value* is a textual **Cypher literal expression**, not a typed Bolt wire value (unlike neo4rs). The driver therefore renders every dynamic value (strings, int/epoch, string lists, embeddings via `vecf32([…])`) through the escaping encoders in `convert.rs` so user data can NEVER break out of a literal — there is no raw string interpolation of user input. Embeddings additionally require the `vecf32([…])` constructor inline on both write and query, and BFS depth is an inline-clamped `usize` (Cypher disallows a parameter in `*1..N`), so the `[1,5]` clamp is the injection guard. Verified by `entity_node_handles_quote_injection_safely`.
+
+### D-39: driver requires a multi-threaded Tokio runtime
+
+The `falkordb` 0.2 crate refreshes the graph schema (label / property-key id → name maps, needed to decode `--compact` result rows) via an internal **blocking** Redis round-trip. Under a single-threaded Tokio runtime that blocking call aborts and rows decode as `Unparseable`. The driver MUST therefore run on a multi-threaded runtime (`#[tokio::test(flavor = "multi_thread")]` / `Runtime::new()` with `rt-multi-thread`). Greentic's production runtime is multi-threaded, so this is only a constraint for tests; all live tests carry the `multi_thread` flavour and serialise the setup+query phase through a shared `tokio::sync::Mutex` (the shared connection can otherwise race a just-built index).
+
+---
+
 ## Consumer migration: `AddEpisodeRequest` → dw-providers v0.3.0
 
 Phase 4 adds **three new fields** to `AddEpisodeRequest` (all additive, all defaulting to "off"):
@@ -272,7 +328,7 @@ Features acknowledged but out of Phase-1 scope. Listed with target phase.
 | `fact_triple` EpisodeType variant | Near-term patch | Read-compat gap (D-7) |
 | ~~Kuzu embedded driver~~ | ❌ Superseded | **Dropped.** Kuzu archived upstream 2025-10-10 (Apple acquisition); see Phase-3 spec amendment. Embedded backend is now SurrealDB. |
 | SurrealDB embedded driver | ✅ Done (Phase 3) | `chronicle-driver-surreal` — full `GraphDriver` supertrait over embedded SurrealDB (`surrealdb` 3.1.3, `kv-rocksdb`/`kv-mem`), feature-gated. Behavior parity with FakeDriver/Neo4j proven by chronicle-testkit + `surreal_e2e` gate. Deviations D-26–D-32. |
-| FalkorDB driver | v1.x | Planned post-v1 |
+| FalkorDB driver | ✅ Done (Phase 6) | `chronicle-driver-falkor` — full `GraphDriver` supertrait over FalkorDB (`falkordb` 0.2.1, openCypher on a Redis module), a Cypher-dialect adaptation of the Neo4j driver. Was "Planned post-v1" in the original spec; now shipped. Behaviour parity proven by the live integration + search suites and the `falkor_e2e` gate (bi-temporal invalidation + community/saga/bulk/triplet/remove through the real driver). Deviations D-33–D-39. Completes the backend roadmap: Neo4j (server) + SurrealDB (embedded) + FalkorDB (Redis server); Neptune stays skipped. |
 | Neptune driver | skipped | Out of scope |
 | Upstream eval/ harness | not applicable | Python pytest-based evaluation suite |
 | MCP / FastAPI servers | not applicable | Python server layer; Greentic integration via `greentic-dw-providers` |

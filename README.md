@@ -18,6 +18,7 @@ workspace so Greentic digital workers gain long-term, bi-temporal, graph-structu
 | `chronicle-core` | Domain types, pipeline (extract → dedup → invalidate → persist), search, prompts, traits |
 | `chronicle-driver-neo4j` | `GraphDriver` implementation over Neo4j via `neo4rs` (Bolt) |
 | `chronicle-driver-surreal` | `GraphDriver` implementation over **embedded** SurrealDB (`surrealdb` 3.1.3, `kv-rocksdb`/`kv-mem`) — server-less graph + HNSW vector + BM25 FTS in one engine |
+| `chronicle-driver-falkor` | `GraphDriver` implementation over **FalkorDB** (`falkordb` 0.2.1) — openCypher on a Redis module; a Cypher-dialect adaptation of the Neo4j driver |
 | `chronicle-llm-openai` | `LlmClient` + `EmbedderClient` over OpenAI-compatible endpoints via `async-openai` |
 | `chronicle-testkit` | `FakeDriver`, `MockLlm`, `MockEmbedder` for deterministic unit tests; driver-conformance integration tests |
 
@@ -27,8 +28,8 @@ workspace so Greentic digital workers gain long-term, bi-temporal, graph-structu
 |---|---|---|---|
 | Neo4j (server) | `chronicle-driver-neo4j` | Available | Bolt via `neo4rs`; the reference / conformance-baseline driver |
 | SurrealDB (embedded) | `chronicle-driver-surreal` | Available | Pure-Rust, server-less; feature-gated. Behaviorally interchangeable with Neo4j behind the `GraphDriver` supertrait |
-| FalkorDB | — | v1.x | Planned post-v1 |
-| Neptune | — | Skipped | Out of scope |
+| FalkorDB (Redis server) | `chronicle-driver-falkor` | Available | openCypher on a Redis module via `falkordb` 0.2; a Cypher-dialect adaptation of the Neo4j driver. Behaviorally interchangeable behind the `GraphDriver` supertrait. Deviations: datetime stored as epoch-millis int, attrs as a JSON string, no atomic `save_all` (best-effort sequential), vector KNN distance→similarity post-filter, edge fulltext via a relationship-fulltext DDL index, requires a multi-threaded Tokio runtime — see `docs/port-fidelity.md` D-33–D-39 |
+| Neptune | — | Skipped | Out of scope (no viable Rust crate) |
 | ~~Kuzu~~ | — | Dropped | Upstream archived 2025-10-10 (Apple acquisition); superseded by SurrealDB embedded — see `docs/port-fidelity.md` |
 
 ---
@@ -134,6 +135,30 @@ The embedded driver bundles graph traversal, HNSW vector similarity, and BM25
 full-text search in one engine — no external service. It is native-only
 (`kv-rocksdb` links RocksDB's C++); see the build note in the driver crate.
 
+### Redis-server backend (FalkorDB)
+
+For ops teams that already run Redis, FalkorDB (openCypher on a Redis module) is
+a drop-in third backend — again, nothing else in the pipeline changes:
+
+```rust,ignore
+use std::sync::Arc;
+use chronicle_core::chronicle::Chronicle;
+use chronicle_driver_falkor::FalkorDriver;
+
+// `graph_name` is the logical graph key in Redis; `embedding_dim` must match
+// your embedder's output dimension. `connect()` builds the indices idempotently.
+let driver = Arc::new(
+    FalkorDriver::connect("falkor://127.0.0.1:6379", "chronicle", 1536).await?,
+);
+
+let chronicle = Chronicle::new(driver, llm, embedder, 0);
+```
+
+FalkorDB stores datetimes as epoch-millis integers and attributes as a JSON
+string, has no atomic `save_all` (best-effort sequential), and **requires a
+multi-threaded Tokio runtime** (the crate's schema refresh blocks). See
+`docs/port-fidelity.md` D-33–D-39 for the full deviation list.
+
 ---
 
 ## Phase Roadmap
@@ -145,9 +170,10 @@ full-text search in one engine — no external service. It is native-only
 | **Phase 2** | Full search parity: BFS traversal, MMR / node-distance / episode-mentions / cross-encoder rerankers, `SearchFilters`, multi-scope `search_()` + `search_with_center()`, complete recipe set; D-3 edge-candidate re-ranking closed | Done |
 | **Phase 4** | Communities (detection + summaries + community search scope), sagas (narrative threading + `summarize_saga`), bulk ingest (`add_episode_bulk` cross-episode dedup), `add_triplet`, `remove_episode`, `get_nodes_and_edges_by_episode`, transactional `save_all` (atomicity gap closed) — **full Graphiti-core parity** | Done |
 | **Phase 3** | Embedded backend: `chronicle-driver-surreal` — full `GraphDriver` supertrait over embedded SurrealDB (graph + HNSW + BM25), e2e parity gate through the real driver. (Original spec named Kuzu; **superseded by SurrealDB** — Kuzu archived upstream, see spec amendment.) | Done |
-| **v1.x** | Entity/edge-type registries + attribute extraction, `extract_summaries_batch`, semaphore fan-out; FalkorDB driver | Planned |
+| **Phase 6** | Third backend: `chronicle-driver-falkor` — full `GraphDriver` supertrait over FalkorDB (openCypher on a Redis module, `falkordb` 0.2), a Cypher-dialect adaptation of the Neo4j driver. e2e parity gate (bi-temporal invalidation + community/saga/bulk/triplet/remove) through the real driver against live `falkordb/falkordb:latest`. Completes the backend roadmap (Neo4j + SurrealDB + FalkorDB; Neptune skipped). | Done |
+| **v1.x** | Entity/edge-type registries + attribute extraction, `extract_summaries_batch`, semaphore fan-out | Planned |
 
-> **Graphiti-core parity:** with Phase 4 complete, chronicle ports the full Graphiti-core surface (ingest, bi-temporal invalidation, hybrid + community search, communities, sagas, bulk, triplets, maintenance). Phase 3 adds a server-less embedded backend (SurrealDB). Remaining items (v1.x) are performance/registry/extra-backend enhancements, not core-semantic gaps.
+> **Graphiti-core parity:** with Phase 4 complete, chronicle ports the full Graphiti-core surface (ingest, bi-temporal invalidation, hybrid + community search, communities, sagas, bulk, triplets, maintenance). Phases 3 + 6 add the embedded (SurrealDB) and Redis-server (FalkorDB) backends alongside Neo4j. Remaining items (v1.x) are performance/registry enhancements, not core-semantic gaps.
 
 Full fidelity notes and all ported-module statuses: [`docs/port-fidelity.md`](docs/port-fidelity.md).
 

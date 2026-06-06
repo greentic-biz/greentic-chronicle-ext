@@ -22,11 +22,16 @@
 //!
 //! ## Phasing
 //!
-//! Task 1 (this commit) implements scaffold + schema + node/edge/episode/
-//! community/saga **persistence** and `retrieve_episodes`. All search, bulk and
-//! maintenance methods return a loud `DriverError::Query("phase-6 task-2/3
-//! pending: ...")` rather than a silent empty success, so the conformance suite
-//! fails honestly until Tasks 2/3 land.
+//! The full `GraphDriver` supertrait is implemented: persistence (Task 1),
+//! search / BFS / embeddings / filters (Task 2), and bulk / maintenance /
+//! community-cluster / saga-threading ops (Task 3). The conformance + e2e gate
+//! exercises this backend through the [`chronicle_core::chronicle::Chronicle`]
+//! facade against live `falkordb/falkordb:latest`.
+//!
+//! `save_all` is the one deliberate behavioural deviation: FalkorDB has no atomic
+//! multi-statement batch, so it is **best-effort sequential** rather than
+//! transactional (the Neo4j backend's `save_all` is atomic). See the
+//! `BulkSaveOps` impl and `docs/port-fidelity.md`.
 
 mod convert;
 mod filters;
@@ -45,19 +50,14 @@ use tracing::debug;
 
 use chronicle_core::driver::{
     BulkSaveOps, CommunityOps, DriverError, EntityEdgeOps, EntityNodeOps, EpisodeOps,
-    EpisodicEdgeOps, GraphDriver, GroupClusterProjection, SagaOps, SchemaOps, SearchOps,
+    EpisodicEdgeOps, GraphDriver, GroupClusterProjection, Neighbor, NodeNeighbors, SagaOps,
+    SchemaOps, SearchOps,
 };
 use chronicle_core::search::filters::SearchFilters;
 use chronicle_core::types::{
     CommunityEdge, CommunityNode, EntityEdge, EntityNode, EpisodeType, EpisodicEdge, EpisodicNode,
     HasEpisodeEdge, NextEpisodeEdge, SagaNode,
 };
-
-/// Marker for not-yet-implemented (Task 3) operations. Loud, never a silent
-/// empty success.
-fn pending(method: &str) -> DriverError {
-    DriverError::Query(format!("phase-6 task-3 pending: {method}"))
-}
 
 /// BFS depth bounds (parity with the Neo4j driver). The depth is inlined into
 /// the var-length pattern `*1..N` (Cypher does not allow a parameter there), so
@@ -444,9 +444,26 @@ impl EntityNodeOps for FalkorDriver {
 
     async fn get_mentioned_nodes(
         &self,
-        _episode_uuids: &[String],
+        episode_uuids: &[String],
     ) -> Result<Vec<EntityNode>, DriverError> {
-        Err(pending("get_mentioned_nodes"))
+        debug!(count = episode_uuids.len(), "falkor get_mentioned_nodes");
+        if episode_uuids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Entities MENTIONS-targeted by any of the given episodes, DISTINCT
+        // (parity with Neo4j GET_MENTIONED_NODES).
+        let cypher = format!(
+            "MATCH (episode:Episodic)-[:MENTIONS]->(n:Entity) \
+             WHERE episode.uuid IN {} RETURN DISTINCT n",
+            convert::lit_string_list(episode_uuids)
+        );
+        self.fetch_nodes(
+            &cypher,
+            &HashMap::new(),
+            "get_mentioned_nodes",
+            convert::entity_node_from_props,
+        )
+        .await
     }
 
     async fn delete_entity_nodes_by_uuids(&self, uuids: &[String]) -> Result<(), DriverError> {
@@ -745,14 +762,49 @@ impl EpisodicEdgeOps for FalkorDriver {
 }
 
 // =====================================================================
-// BulkSaveOps — Task 3 (transactional save_all). Inherit default sequential
-// for now; FalkorDB has no multi-statement atomic batch, so the eventual
-// implementation will be documented best-effort. The default impl already does
-// the four sequential saves correctly.
+// BulkSaveOps — best-effort sequential save_all (DEVIATION).
+//
+// FalkorDB's `GRAPH.QUERY` rejects `;`-separated multi-statement bodies and the
+// `falkordb` 0.2 crate exposes no MULTI/EXEC transaction handle, so there is no
+// way to wrap the four collection writes in a single atomic batch. Unlike the
+// Neo4j backend (which OVERRIDES `save_all` with a real `start_txn → run all →
+// commit`), this backend keeps the default-shaped four-call sequence: episodes,
+// entity nodes, entity edges, episodic edges, in that order.
+//
+// We still OVERRIDE the trait method (rather than inherit the default) to make
+// the atomicity deviation explicit at the call site and to document it here: a
+// mid-batch failure leaves earlier collections persisted (no rollback). The
+// ordering matches the default so a later failure (e.g. an edge whose endpoint
+// node never saved) cannot succeed-then-orphan. This is an accepted FalkorDB
+// limitation, recorded in docs/port-fidelity.md.
 // =====================================================================
 
 #[async_trait]
-impl BulkSaveOps for FalkorDriver {}
+impl BulkSaveOps for FalkorDriver {
+    async fn save_all(
+        &self,
+        episodes: &[EpisodicNode],
+        episodic_edges: &[EpisodicEdge],
+        entity_nodes: &[EntityNode],
+        entity_edges: &[EntityEdge],
+    ) -> Result<(), DriverError> {
+        debug!(
+            episodes = episodes.len(),
+            episodic_edges = episodic_edges.len(),
+            entity_nodes = entity_nodes.len(),
+            entity_edges = entity_edges.len(),
+            "falkor save_all (best-effort sequential — no atomic batch)"
+        );
+        // DEVIATION: best-effort, non-atomic. See the module comment above.
+        for episode in episodes {
+            self.save_episode(episode).await?;
+        }
+        self.save_entity_nodes(entity_nodes).await?;
+        self.save_entity_edges(entity_edges).await?;
+        self.save_episodic_edges(episodic_edges).await?;
+        Ok(())
+    }
+}
 
 // =====================================================================
 // SearchOps — all Task 2.
@@ -1187,53 +1239,208 @@ impl CommunityOps for FalkorDriver {
 
     async fn community_fulltext_search(
         &self,
-        _query: &str,
-        _group_ids: &[String],
-        _limit: usize,
+        query: &str,
+        group_ids: &[String],
+        limit: usize,
     ) -> Result<Vec<CommunityNode>, DriverError> {
-        Err(pending("community_fulltext_search"))
+        debug!(query, limit, "falkor community_fulltext_search");
+        if query.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let where_block = if group_ids.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " WHERE n.group_id IN {}",
+                convert::lit_string_list(group_ids)
+            )
+        };
+        let cypher = format!(
+            "CALL db.idx.fulltext.queryNodes('Community', {q}) YIELD node AS n, score{where_block} \
+             RETURN n ORDER BY score DESC LIMIT {lim}",
+            q = convert::lit_str(query),
+            lim = convert::lit_int(limit as i64),
+        );
+        self.fetch_nodes(
+            &cypher,
+            &HashMap::new(),
+            "community_fulltext_search",
+            convert::community_node_from_props,
+        )
+        .await
     }
 
     async fn community_similarity_search(
         &self,
-        _search_vector: &[f32],
-        _group_ids: &[String],
-        _limit: usize,
-        _min_score: f32,
+        search_vector: &[f32],
+        group_ids: &[String],
+        limit: usize,
+        min_score: f32,
     ) -> Result<Vec<CommunityNode>, DriverError> {
-        Err(pending("community_similarity_search"))
+        debug!(limit, min_score, "falkor community_similarity_search");
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let k = overfetch(limit);
+        let where_block = where_clause(&group_scope_node(group_ids));
+        let cypher = format!(
+            "CALL db.idx.vector.queryNodes('Community','name_embedding',{k},{vec}) \
+             YIELD node AS n, score{where_block} \
+             RETURN n, score ORDER BY score ASC",
+            vec = convert::lit_vecf32(search_vector),
+        );
+        let rows = self
+            .fetch_rows(&cypher, &HashMap::new(), "community_similarity_search")
+            .await?;
+        self.collect_scored_nodes(rows, min_score, limit, convert::community_node_from_props)
     }
 
     async fn get_embeddings_for_communities(
         &self,
-        _uuids: &[String],
+        uuids: &[String],
     ) -> Result<HashMap<String, Vec<f32>>, DriverError> {
-        Err(pending("get_embeddings_for_communities"))
+        debug!(count = uuids.len(), "falkor get_embeddings_for_communities");
+        if uuids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let cypher = format!(
+            "MATCH (n:Community) WHERE n.uuid IN {} AND n.name_embedding IS NOT NULL \
+             RETURN DISTINCT n.uuid, n.name_embedding",
+            convert::lit_string_list(uuids)
+        );
+        let rows = self
+            .fetch_rows(&cypher, &HashMap::new(), "get_embeddings_for_communities")
+            .await?;
+        embeddings_from_rows(rows)
     }
 
     async fn remove_communities(&self) -> Result<(), DriverError> {
-        Err(pending("remove_communities"))
+        debug!("falkor remove_communities");
+        // DETACH DELETE all Community nodes (removes incident HAS_MEMBER edges).
+        // Always full-graph (no group scope) per upstream.
+        self.run(
+            "MATCH (c:Community) DETACH DELETE c",
+            &HashMap::new(),
+            "remove_communities",
+        )
+        .await
     }
 
     async fn get_community_clusters(
         &self,
-        _group_ids: &[String],
+        group_ids: &[String],
     ) -> Result<Vec<GroupClusterProjection>, DriverError> {
-        Err(pending("get_community_clusters"))
+        debug!(count = group_ids.len(), "falkor get_community_clusters");
+
+        // Resolve the group set: explicit param, or all distinct entity group_ids
+        // (mirrors Neo4j's `collect(DISTINCT n.group_id)`).
+        let groups: Vec<String> = if group_ids.is_empty() {
+            let rows = self
+                .fetch_rows(
+                    "MATCH (n:Entity) WHERE n.group_id IS NOT NULL RETURN DISTINCT n.group_id",
+                    &HashMap::new(),
+                    "distinct_entity_group_ids",
+                )
+                .await?;
+            let mut out = Vec::with_capacity(rows.len());
+            for row in &rows {
+                let value = row.first().ok_or_else(|| {
+                    DriverError::Decode("distinct_entity_group_ids: empty row".into())
+                })?;
+                out.push(convert::string_from_value(value)?);
+            }
+            out
+        } else {
+            group_ids.to_vec()
+        };
+
+        let mut out: Vec<GroupClusterProjection> = Vec::new();
+        for group_id in groups {
+            // Nodes in this group drive the per-node neighbour projection.
+            let nodes = self
+                .get_entity_nodes_by_group_ids(std::slice::from_ref(&group_id))
+                .await?;
+            let mut node_neighbors: Vec<NodeNeighbors> = Vec::with_capacity(nodes.len());
+            for node in &nodes {
+                // Undirected RELATES_TO neighbours within the same group, with the
+                // count of edges to each (parity with the Neo4j cluster query
+                // `(n)-[e:RELATES_TO]-(m) WITH count(e) AS count, m.uuid`).
+                let cypher = format!(
+                    "MATCH (n:Entity {{group_id: {gid}, uuid: {uuid}}})\
+                     -[e:RELATES_TO]-(m:Entity {{group_id: {gid}}}) \
+                     RETURN m.uuid, count(e)",
+                    gid = convert::lit_str(&group_id),
+                    uuid = convert::lit_str(&node.uuid),
+                );
+                let rows = self
+                    .fetch_rows(&cypher, &HashMap::new(), "community_cluster_node_neighbors")
+                    .await?;
+                let mut neighbors: Vec<Neighbor> = Vec::with_capacity(rows.len());
+                for row in &rows {
+                    let node_uuid = convert::string_from_value(row.first().ok_or_else(|| {
+                        DriverError::Decode("cluster neighbour row missing uuid".into())
+                    })?)?;
+                    let count = convert::i64_from_value(row.get(1).ok_or_else(|| {
+                        DriverError::Decode("cluster neighbour row missing count".into())
+                    })?)?;
+                    neighbors.push(Neighbor {
+                        node_uuid,
+                        edge_count: count.max(0) as u64,
+                    });
+                }
+                node_neighbors.push(NodeNeighbors {
+                    node_uuid: node.uuid.clone(),
+                    neighbors,
+                });
+            }
+            out.push(GroupClusterProjection {
+                group_id,
+                nodes: node_neighbors,
+            });
+        }
+        Ok(out)
     }
 
     async fn community_of_member(
         &self,
-        _entity_uuid: &str,
+        entity_uuid: &str,
     ) -> Result<Option<CommunityNode>, DriverError> {
-        Err(pending("community_of_member"))
+        debug!(entity_uuid, "falkor community_of_member");
+        // First community with a HAS_MEMBER edge to this entity (parity with Neo4j
+        // COMMUNITY_OF_MEMBER).
+        let cypher = format!(
+            "MATCH (c:Community)-[:HAS_MEMBER]->(n:Entity {{uuid: {}}}) RETURN c LIMIT 1",
+            convert::lit_str(entity_uuid)
+        );
+        self.fetch_one_node(
+            &cypher,
+            &HashMap::new(),
+            "community_of_member",
+            convert::community_node_from_props,
+        )
+        .await
     }
 
     async fn neighbor_communities(
         &self,
-        _entity_uuid: &str,
+        entity_uuid: &str,
     ) -> Result<Vec<CommunityNode>, DriverError> {
-        Err(pending("neighbor_communities"))
+        debug!(entity_uuid, "falkor neighbor_communities");
+        // ONE row per neighbour's community membership — NOT deduplicated; the
+        // caller does the mode/plurality count (parity with Neo4j
+        // NEIGHBOR_COMMUNITIES).
+        let cypher = format!(
+            "MATCH (c:Community)-[:HAS_MEMBER]->(m:Entity)-[:RELATES_TO]-(n:Entity {{uuid: {}}}) \
+             RETURN c",
+            convert::lit_str(entity_uuid)
+        );
+        self.fetch_nodes(
+            &cypher,
+            &HashMap::new(),
+            "neighbor_communities",
+            convert::community_node_from_props,
+        )
+        .await
     }
 }
 
@@ -1348,19 +1555,81 @@ impl SagaOps for FalkorDriver {
 
     async fn saga_previous_episode_uuid(
         &self,
-        _saga_uuid: &str,
-        _current_episode_uuid: &str,
+        saga_uuid: &str,
+        current_episode_uuid: &str,
     ) -> Result<Option<String>, DriverError> {
-        Err(pending("saga_previous_episode_uuid"))
+        debug!(saga_uuid, "falkor saga_previous_episode_uuid");
+        // Latest prior HAS_EPISODE episode by valid_at (epoch int) DESC, then
+        // created_at DESC, excluding the current episode (parity with Neo4j).
+        let cypher = format!(
+            "MATCH (s:Saga {{uuid: {saga}}})-[:HAS_EPISODE]->(e:Episodic) \
+             WHERE e.uuid <> {current} \
+             RETURN e.uuid ORDER BY e.valid_at DESC, e.created_at DESC LIMIT 1",
+            saga = convert::lit_str(saga_uuid),
+            current = convert::lit_str(current_episode_uuid),
+        );
+        let rows = self
+            .fetch_rows(&cypher, &HashMap::new(), "saga_previous_episode_uuid")
+            .await?;
+        match rows.first().and_then(|r| r.first()) {
+            Some(value) => Ok(Some(convert::string_from_value(value)?)),
+            None => Ok(None),
+        }
     }
 
     async fn saga_episode_contents(
         &self,
-        _saga_uuid: &str,
-        _since: Option<DateTime<Utc>>,
-        _limit: usize,
+        saga_uuid: &str,
+        since: Option<DateTime<Utc>>,
+        limit: usize,
     ) -> Result<Vec<(String, DateTime<Utc>)>, DriverError> {
-        Err(pending("saga_episode_contents"))
+        debug!(saga_uuid, limit, "falkor saga_episode_contents");
+        // `since` filters `created_at > since` and returns chronological ASC; the
+        // no-watermark path takes the latest `limit` (DESC) then reverses to
+        // chronological order (parity with Neo4j). All temporal fields are epoch
+        // millis so comparisons/orderings are integer comparisons.
+        let (cypher, reverse) = match since {
+            Some(s) => (
+                format!(
+                    "MATCH (s:Saga {{uuid: {saga}}})-[:HAS_EPISODE]->(e:Episodic) \
+                     WHERE e.created_at > {since} \
+                     RETURN e.content, e.valid_at \
+                     ORDER BY e.valid_at ASC, e.created_at ASC LIMIT {lim}",
+                    saga = convert::lit_str(saga_uuid),
+                    since = convert::lit_datetime(s),
+                    lim = convert::lit_int(limit as i64),
+                ),
+                false,
+            ),
+            None => (
+                format!(
+                    "MATCH (s:Saga {{uuid: {saga}}})-[:HAS_EPISODE]->(e:Episodic) \
+                     RETURN e.content, e.valid_at \
+                     ORDER BY e.valid_at DESC, e.created_at DESC LIMIT {lim}",
+                    saga = convert::lit_str(saga_uuid),
+                    lim = convert::lit_int(limit as i64),
+                ),
+                true,
+            ),
+        };
+        let rows = self
+            .fetch_rows(&cypher, &HashMap::new(), "saga_episode_contents")
+            .await?;
+        let mut out: Vec<(String, DateTime<Utc>)> = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let content = convert::string_from_value(row.first().ok_or_else(|| {
+                DriverError::Decode("saga episode-content row missing content".into())
+            })?)?;
+            let valid_at =
+                convert::millis_to_datetime(convert::i64_from_value(row.get(1).ok_or_else(
+                    || DriverError::Decode("saga episode-content row missing valid_at".into()),
+                )?)?)?;
+            out.push((content, valid_at));
+        }
+        if reverse {
+            out.reverse();
+        }
+        Ok(out)
     }
 }
 

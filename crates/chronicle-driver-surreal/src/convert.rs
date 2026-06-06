@@ -181,6 +181,132 @@ pub struct LinkEdgeRow {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// Scored rows (search results carry a relevance/similarity score alongside the
+// node/edge row). The `score` column is projected by the search query
+// (`... AS score`); `f64` is the SurrealDB number kind for both BM25 scores and
+// the cosine-similarity we derive from the KNN distance.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// An entity-node row plus its search score.
+#[derive(SurrealValue)]
+pub struct ScoredEntityNodeRow {
+    pub uuid: String,
+    pub name: String,
+    pub group_id: String,
+    pub labels: Vec<String>,
+    pub created_at: Datetime,
+    pub summary: String,
+    pub attributes: Value,
+    pub name_embedding: Option<Vec<f32>>,
+    pub score: f64,
+}
+
+impl ScoredEntityNodeRow {
+    /// Split into the underlying row and its score.
+    pub fn into_parts(self) -> (EntityNodeRow, f64) {
+        (
+            EntityNodeRow {
+                uuid: self.uuid,
+                name: self.name,
+                group_id: self.group_id,
+                labels: self.labels,
+                created_at: self.created_at,
+                summary: self.summary,
+                attributes: self.attributes,
+                name_embedding: self.name_embedding,
+            },
+            self.score,
+        )
+    }
+}
+
+/// An entity-edge row plus its search score.
+#[derive(SurrealValue)]
+pub struct ScoredEntityEdgeRow {
+    pub uuid: String,
+    pub source_node_uuid: String,
+    pub target_node_uuid: String,
+    pub name: String,
+    pub fact: String,
+    pub group_id: String,
+    pub episodes: Vec<String>,
+    pub created_at: Datetime,
+    pub expired_at: Option<Datetime>,
+    pub valid_at: Option<Datetime>,
+    pub invalid_at: Option<Datetime>,
+    pub attributes: Value,
+    pub fact_embedding: Option<Vec<f32>>,
+    pub score: f64,
+}
+
+impl ScoredEntityEdgeRow {
+    /// Split into the underlying row and its score.
+    pub fn into_parts(self) -> (EntityEdgeRow, f64) {
+        (
+            EntityEdgeRow {
+                uuid: self.uuid,
+                source_node_uuid: self.source_node_uuid,
+                target_node_uuid: self.target_node_uuid,
+                name: self.name,
+                fact: self.fact,
+                group_id: self.group_id,
+                episodes: self.episodes,
+                created_at: self.created_at,
+                expired_at: self.expired_at,
+                valid_at: self.valid_at,
+                invalid_at: self.invalid_at,
+                attributes: self.attributes,
+                fact_embedding: self.fact_embedding,
+            },
+            self.score,
+        )
+    }
+}
+
+/// A community-node row plus its search score.
+#[derive(SurrealValue)]
+pub struct ScoredCommunityNodeRow {
+    pub uuid: String,
+    pub name: String,
+    pub group_id: String,
+    pub created_at: Datetime,
+    pub summary: String,
+    pub name_embedding: Option<Vec<f32>>,
+    pub score: f64,
+}
+
+impl ScoredCommunityNodeRow {
+    /// Split into the underlying row and its score.
+    pub fn into_parts(self) -> (CommunityNodeRow, f64) {
+        (
+            CommunityNodeRow {
+                uuid: self.uuid,
+                name: self.name,
+                group_id: self.group_id,
+                created_at: self.created_at,
+                summary: self.summary,
+                name_embedding: self.name_embedding,
+            },
+            self.score,
+        )
+    }
+}
+
+/// A `(uuid, embedding)` projection row for the MMR embedding loaders.
+#[derive(SurrealValue)]
+pub struct EmbeddingRow {
+    pub uuid: String,
+    pub embedding: Vec<f32>,
+}
+
+/// A `(uuid, count)` projection row for the mention-count reranker support.
+#[derive(SurrealValue)]
+pub struct MentionCountRow {
+    pub uuid: String,
+    pub count: i64,
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // chronicle -> row
 // ─────────────────────────────────────────────────────────────────────────
 

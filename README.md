@@ -104,9 +104,11 @@ A runnable version of this snippet lives at
 | **Phase 0** | Workspace scaffold, crate skeletons, CI | Done |
 | **Phase 1** | Core loop: add_episode (extract → dedup → bi-temporal invalidation → persist), hybrid RRF search, Neo4j driver, OpenAI LLM/embedder, 185 tests green | Done |
 | **Phase 2** | Full search parity: BFS traversal, MMR / node-distance / episode-mentions / cross-encoder rerankers, `SearchFilters`, multi-scope `search_()` + `search_with_center()`, complete recipe set; D-3 edge-candidate re-ranking closed | Done |
-| **Phase 3** | Entity/edge-type registries + attribute extraction, `extract_summaries_batch`, `save_all` transaction, semaphore fan-out, multi-episode bulk path, Kuzu embedded driver (`chronicle-driver-kuzu`) | Planned |
-| **Phase 4** | Communities, sagas, bulk ingest, community search scope + `SearchResults` community fields | Planned |
+| **Phase 4** | Communities (detection + summaries + community search scope), sagas (narrative threading + `summarize_saga`), bulk ingest (`add_episode_bulk` cross-episode dedup), `add_triplet`, `remove_episode`, `get_nodes_and_edges_by_episode`, transactional `save_all` (atomicity gap closed) — **full Graphiti-core parity** | Done |
+| **Phase 3** | Entity/edge-type registries + attribute extraction, `extract_summaries_batch`, semaphore fan-out, Kuzu embedded driver (`chronicle-driver-kuzu`) | Planned |
 | **v1.x** | FalkorDB driver | Planned |
+
+> **Graphiti-core parity:** with Phase 4 complete, chronicle ports the full Graphiti-core surface (ingest, bi-temporal invalidation, hybrid + community search, communities, sagas, bulk, triplets, maintenance). Remaining items (Phase 3, v1.x) are performance/registry/extra-backend enhancements, not core-semantic gaps.
 
 Full fidelity notes and all ported-module statuses: [`docs/port-fidelity.md`](docs/port-fidelity.md).
 

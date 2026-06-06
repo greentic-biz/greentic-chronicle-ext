@@ -6,11 +6,15 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
 use chronicle_core::driver::{
-    DriverError, EntityEdgeOps, EntityNodeOps, EpisodeOps, EpisodicEdgeOps, GraphDriver, SchemaOps,
-    SearchOps,
+    BulkSaveOps, CommunityOps, DriverError, EntityEdgeOps, EntityNodeOps, EpisodeOps,
+    EpisodicEdgeOps, GraphDriver, GroupClusterProjection, Neighbor, NodeNeighbors, SagaOps,
+    SchemaOps, SearchOps,
 };
 use chronicle_core::search::filters::{ComparisonOperator, DateFilter, SearchFilters};
-use chronicle_core::types::{EntityEdge, EntityNode, EpisodeType, EpisodicEdge, EpisodicNode};
+use chronicle_core::types::{
+    CommunityEdge, CommunityNode, EntityEdge, EntityNode, EpisodeType, EpisodicEdge, EpisodicNode,
+    HasEpisodeEdge, NextEpisodeEdge, SagaNode,
+};
 
 // ---------------------------------------------------------------------------
 // Inner state — all fields Default
@@ -22,6 +26,11 @@ struct Inner {
     entity_edges: HashMap<String, EntityEdge>,
     episodic_nodes: HashMap<String, EpisodicNode>,
     episodic_edges: Vec<EpisodicEdge>,
+    community_nodes: HashMap<String, CommunityNode>,
+    community_edges: Vec<CommunityEdge>,
+    saga_nodes: HashMap<String, SagaNode>,
+    has_episode_edges: Vec<HasEpisodeEdge>,
+    next_episode_edges: Vec<NextEpisodeEdge>,
 }
 
 // ---------------------------------------------------------------------------
@@ -48,6 +57,24 @@ impl FakeDriver {
             .lock()
             .map(|g| g.episodic_edges.len())
             .unwrap_or(0)
+    }
+
+    /// Snapshot of all stored NEXT_EPISODE edges (test inspection).
+    /// Returns an empty vec if the lock is poisoned.
+    pub fn next_episode_edges(&self) -> Vec<NextEpisodeEdge> {
+        self.inner
+            .lock()
+            .map(|g| g.next_episode_edges.clone())
+            .unwrap_or_default()
+    }
+
+    /// Snapshot of all stored HAS_EPISODE edges (test inspection).
+    /// Returns an empty vec if the lock is poisoned.
+    pub fn has_episode_edges(&self) -> Vec<HasEpisodeEdge> {
+        self.inner
+            .lock()
+            .map(|g| g.has_episode_edges.clone())
+            .unwrap_or_default()
     }
 }
 
@@ -233,6 +260,63 @@ impl EntityNodeOps for FakeDriver {
             .filter_map(|id| g.entity_nodes.get(id).cloned())
             .collect())
     }
+
+    /// Entity nodes whose `group_id` is in `group_ids` (empty → none). Mirrors
+    /// upstream `EntityNode.get_by_group_ids`.
+    async fn get_entity_nodes_by_group_ids(
+        &self,
+        group_ids: &[String],
+    ) -> Result<Vec<EntityNode>, DriverError> {
+        let g = lock!(self)?;
+        if group_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(g.entity_nodes
+            .values()
+            .filter(|n| group_ids.contains(&n.group_id))
+            .cloned()
+            .collect())
+    }
+
+    /// Entity nodes that are MENTIONS targets of any of `episode_uuids` (upstream
+    /// `get_mentioned_nodes`). DISTINCT by node uuid; empty input → none.
+    async fn get_mentioned_nodes(
+        &self,
+        episode_uuids: &[String],
+    ) -> Result<Vec<EntityNode>, DriverError> {
+        let g = lock!(self)?;
+        if episode_uuids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let eps: std::collections::HashSet<&String> = episode_uuids.iter().collect();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut out: Vec<EntityNode> = Vec::new();
+        for me in &g.episodic_edges {
+            if eps.contains(&me.source_node_uuid)
+                && let Some(node) = g.entity_nodes.get(&me.target_node_uuid)
+                && seen.insert(node.uuid.clone())
+            {
+                out.push(node.clone());
+            }
+        }
+        Ok(out)
+    }
+
+    /// Remove Entity nodes by uuid; also drops the RELATES_TO / MENTIONS /
+    /// HAS_MEMBER edges that touch them (DETACH-DELETE semantics).
+    async fn delete_entity_nodes_by_uuids(&self, uuids: &[String]) -> Result<(), DriverError> {
+        let mut g = lock!(self)?;
+        let set: std::collections::HashSet<&String> = uuids.iter().collect();
+        g.entity_nodes.retain(|id, _| !set.contains(id));
+        g.entity_edges.retain(|_, e| {
+            !set.contains(&e.source_node_uuid) && !set.contains(&e.target_node_uuid)
+        });
+        g.episodic_edges
+            .retain(|e| !set.contains(&e.target_node_uuid));
+        g.community_edges
+            .retain(|e| !set.contains(&e.source_node_uuid) && !set.contains(&e.target_node_uuid));
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -267,6 +351,28 @@ impl EntityEdgeOps for FakeDriver {
             .filter(|e| e.source_node_uuid == source_uuid && e.target_node_uuid == target_uuid)
             .cloned()
             .collect())
+    }
+
+    /// Entity edges by uuid (upstream `EntityEdge.get_by_uuids`). Preserves input
+    /// order; skips missing uuids.
+    async fn get_entity_edges_by_uuids(
+        &self,
+        uuids: &[String],
+    ) -> Result<Vec<EntityEdge>, DriverError> {
+        let g = lock!(self)?;
+        Ok(uuids
+            .iter()
+            .filter_map(|id| g.entity_edges.get(id).cloned())
+            .collect())
+    }
+
+    /// Remove RELATES_TO edges by uuid (upstream `Edge.delete_by_uuids`). Empty
+    /// input is a no-op.
+    async fn delete_entity_edges_by_uuids(&self, uuids: &[String]) -> Result<(), DriverError> {
+        let mut g = lock!(self)?;
+        let set: std::collections::HashSet<&String> = uuids.iter().collect();
+        g.entity_edges.retain(|id, _| !set.contains(id));
+        Ok(())
     }
 }
 
@@ -332,6 +438,19 @@ impl EpisodeOps for FakeDriver {
         result.reverse();
         Ok(result)
     }
+
+    /// Remove one episode by uuid; also drops MENTIONS / HAS_EPISODE /
+    /// NEXT_EPISODE edges that touch it (DETACH-DELETE semantics). Missing uuid is
+    /// a no-op.
+    async fn delete_episode(&self, uuid: &str) -> Result<(), DriverError> {
+        let mut g = lock!(self)?;
+        g.episodic_nodes.remove(uuid);
+        g.episodic_edges.retain(|e| e.source_node_uuid != uuid);
+        g.has_episode_edges.retain(|e| e.target_node_uuid != uuid);
+        g.next_episode_edges
+            .retain(|e| e.source_node_uuid != uuid && e.target_node_uuid != uuid);
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -348,6 +467,14 @@ impl EpisodicEdgeOps for FakeDriver {
         Ok(())
     }
 }
+
+// ---------------------------------------------------------------------------
+// BulkSaveOps
+// ---------------------------------------------------------------------------
+
+// In-memory driver: nothing can partially fail, so the default sequential
+// `save_all` (four ops in order) is correct without a real transaction.
+impl BulkSaveOps for FakeDriver {}
 
 // ---------------------------------------------------------------------------
 // SearchOps
@@ -790,6 +917,377 @@ fn outgoing_targets(inner: &Inner, current: &str) -> Vec<String> {
         }
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// CommunityOps
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl CommunityOps for FakeDriver {
+    async fn save_community_nodes(&self, nodes: &[CommunityNode]) -> Result<(), DriverError> {
+        let mut g = lock!(self)?;
+        for n in nodes {
+            g.community_nodes.insert(n.uuid.clone(), n.clone());
+        }
+        Ok(())
+    }
+
+    /// Upsert HAS_MEMBER edges. De-dups by edge uuid (mirrors the MERGE-by-uuid
+    /// upstream save), replacing an existing edge with the same uuid.
+    async fn save_community_edges(&self, edges: &[CommunityEdge]) -> Result<(), DriverError> {
+        let mut g = lock!(self)?;
+        for e in edges {
+            if let Some(slot) = g.community_edges.iter_mut().find(|x| x.uuid == e.uuid) {
+                *slot = e.clone();
+            } else {
+                g.community_edges.push(e.clone());
+            }
+        }
+        Ok(())
+    }
+
+    async fn get_community_nodes_by_group_ids(
+        &self,
+        group_ids: &[String],
+    ) -> Result<Vec<CommunityNode>, DriverError> {
+        let g = lock!(self)?;
+        if group_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(g.community_nodes
+            .values()
+            .filter(|c| group_ids.contains(&c.group_id))
+            .cloned()
+            .collect())
+    }
+
+    async fn get_community_nodes_by_uuids(
+        &self,
+        uuids: &[String],
+    ) -> Result<Vec<CommunityNode>, DriverError> {
+        let g = lock!(self)?;
+        Ok(uuids
+            .iter()
+            .filter_map(|id| g.community_nodes.get(id).cloned())
+            .collect())
+    }
+
+    /// Brute-force fulltext: case-insensitive substring of `query` against the
+    /// community `name`. Group-filtered when `group_ids` is non-empty; truncated
+    /// to `limit`. Not a real BM25 ranking — assert recall, not ranking precision.
+    async fn community_fulltext_search(
+        &self,
+        query: &str,
+        group_ids: &[String],
+        limit: usize,
+    ) -> Result<Vec<CommunityNode>, DriverError> {
+        let g = lock!(self)?;
+        let q = query.to_lowercase();
+        Ok(g.community_nodes
+            .values()
+            .filter(|c| {
+                c.name.to_lowercase().contains(&q)
+                    && (group_ids.is_empty() || group_ids.contains(&c.group_id))
+            })
+            .take(limit)
+            .cloned()
+            .collect())
+    }
+
+    /// Brute-force cosine similarity against stored `name_embedding`. Communities
+    /// without an embedding are skipped. Filtered by `score > min_score` + group;
+    /// sorted DESC by score (uuid tie-break); truncated to `limit`.
+    async fn community_similarity_search(
+        &self,
+        search_vector: &[f32],
+        group_ids: &[String],
+        limit: usize,
+        min_score: f32,
+    ) -> Result<Vec<CommunityNode>, DriverError> {
+        let g = lock!(self)?;
+        let mut scored: Vec<(f32, CommunityNode)> = g
+            .community_nodes
+            .values()
+            .filter_map(|c| {
+                let emb = c.name_embedding.as_deref()?;
+                let score = cosine(search_vector, emb);
+                if score > min_score && (group_ids.is_empty() || group_ids.contains(&c.group_id)) {
+                    Some((score, c.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        scored.sort_by(|a, b| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.1.uuid.cmp(&b.1.uuid))
+        });
+        Ok(scored.into_iter().take(limit).map(|(_, c)| c).collect())
+    }
+
+    async fn get_embeddings_for_communities(
+        &self,
+        uuids: &[String],
+    ) -> Result<HashMap<String, Vec<f32>>, DriverError> {
+        let g = lock!(self)?;
+        let mut map = HashMap::new();
+        for id in uuids {
+            if let Some(c) = g.community_nodes.get(id)
+                && let Some(emb) = &c.name_embedding
+            {
+                map.insert(id.clone(), emb.clone());
+            }
+        }
+        Ok(map)
+    }
+
+    /// Drop ALL community nodes + their HAS_MEMBER edges (upstream
+    /// `remove_communities`: `MATCH (c:Community) DETACH DELETE c`).
+    async fn remove_communities(&self) -> Result<(), DriverError> {
+        let mut g = lock!(self)?;
+        g.community_nodes.clear();
+        g.community_edges.clear();
+        Ok(())
+    }
+
+    /// Per-group RELATES_TO adjacency projection (upstream `get_community_clusters`
+    /// / R2). For each group (or all distinct entity group_ids when `group_ids` is
+    /// empty), each node's neighbour list is the UNDIRECTED RELATES_TO adjacency
+    /// (`-[e:RELATES_TO]-`) restricted to the SAME group, with the edge count per
+    /// neighbour uuid.
+    async fn get_community_clusters(
+        &self,
+        group_ids: &[String],
+    ) -> Result<Vec<GroupClusterProjection>, DriverError> {
+        let g = lock!(self)?;
+
+        // Resolve the group set: explicit, or all distinct entity group_ids.
+        let groups: Vec<String> = if group_ids.is_empty() {
+            let mut set: Vec<String> = g
+                .entity_nodes
+                .values()
+                .map(|n| n.group_id.clone())
+                .collect();
+            set.sort();
+            set.dedup();
+            set
+        } else {
+            group_ids.to_vec()
+        };
+
+        let mut out: Vec<GroupClusterProjection> = Vec::new();
+        for group_id in groups {
+            // Nodes in this group, sorted by uuid for deterministic ordering.
+            let mut nodes: Vec<&EntityNode> = g
+                .entity_nodes
+                .values()
+                .filter(|n| n.group_id == group_id)
+                .collect();
+            nodes.sort_by(|a, b| a.uuid.cmp(&b.uuid));
+
+            let mut node_neighbors: Vec<NodeNeighbors> = Vec::new();
+            for node in nodes {
+                // Count RELATES_TO edges to each same-group neighbour (undirected).
+                let mut counts: HashMap<String, u64> = HashMap::new();
+                for e in g.entity_edges.values() {
+                    let other = if e.source_node_uuid == node.uuid {
+                        Some(&e.target_node_uuid)
+                    } else if e.target_node_uuid == node.uuid {
+                        Some(&e.source_node_uuid)
+                    } else {
+                        None
+                    };
+                    if let Some(other) = other
+                        && let Some(m) = g.entity_nodes.get(other)
+                        && m.group_id == group_id
+                    {
+                        *counts.entry(other.clone()).or_insert(0) += 1;
+                    }
+                }
+                let mut neighbors: Vec<Neighbor> = counts
+                    .into_iter()
+                    .map(|(node_uuid, edge_count)| Neighbor {
+                        node_uuid,
+                        edge_count,
+                    })
+                    .collect();
+                neighbors.sort_by(|a, b| a.node_uuid.cmp(&b.node_uuid));
+                node_neighbors.push(NodeNeighbors {
+                    node_uuid: node.uuid.clone(),
+                    neighbors,
+                });
+            }
+            out.push(GroupClusterProjection {
+                group_id,
+                nodes: node_neighbors,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Already-member lookup (R4 step a): the first community with a HAS_MEMBER
+    /// edge targeting `entity_uuid`.
+    async fn community_of_member(
+        &self,
+        entity_uuid: &str,
+    ) -> Result<Option<CommunityNode>, DriverError> {
+        let g = lock!(self)?;
+        for e in &g.community_edges {
+            if e.target_node_uuid == entity_uuid
+                && let Some(c) = g.community_nodes.get(&e.source_node_uuid)
+            {
+                return Ok(Some(c.clone()));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Neighbour-vote lookup (R4 step b): ONE community row per RELATES_TO
+    /// neighbour of `entity_uuid` that is a HAS_MEMBER of some community. NOT
+    /// deduplicated — duplicates carry the plurality the caller mode-counts.
+    async fn neighbor_communities(
+        &self,
+        entity_uuid: &str,
+    ) -> Result<Vec<CommunityNode>, DriverError> {
+        let g = lock!(self)?;
+
+        // RELATES_TO neighbours of the entity (undirected).
+        let mut neighbors: Vec<String> = Vec::new();
+        for e in g.entity_edges.values() {
+            if e.source_node_uuid == entity_uuid {
+                neighbors.push(e.target_node_uuid.clone());
+            } else if e.target_node_uuid == entity_uuid {
+                neighbors.push(e.source_node_uuid.clone());
+            }
+        }
+
+        // For each (neighbour, community-membership) pair emit a community row.
+        let mut out: Vec<CommunityNode> = Vec::new();
+        for neighbor in &neighbors {
+            for ce in &g.community_edges {
+                if &ce.target_node_uuid == neighbor
+                    && let Some(c) = g.community_nodes.get(&ce.source_node_uuid)
+                {
+                    out.push(c.clone());
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SagaOps
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl SagaOps for FakeDriver {
+    async fn save_saga_node(&self, node: &SagaNode) -> Result<(), DriverError> {
+        let mut g = lock!(self)?;
+        g.saga_nodes.insert(node.uuid.clone(), node.clone());
+        Ok(())
+    }
+
+    async fn save_has_episode_edge(&self, edge: &HasEpisodeEdge) -> Result<(), DriverError> {
+        let mut g = lock!(self)?;
+        if let Some(slot) = g.has_episode_edges.iter_mut().find(|x| x.uuid == edge.uuid) {
+            *slot = edge.clone();
+        } else {
+            g.has_episode_edges.push(edge.clone());
+        }
+        Ok(())
+    }
+
+    async fn save_next_episode_edge(&self, edge: &NextEpisodeEdge) -> Result<(), DriverError> {
+        let mut g = lock!(self)?;
+        if let Some(slot) = g
+            .next_episode_edges
+            .iter_mut()
+            .find(|x| x.uuid == edge.uuid)
+        {
+            *slot = edge.clone();
+        } else {
+            g.next_episode_edges.push(edge.clone());
+        }
+        Ok(())
+    }
+
+    /// Get-or-create lookup (R9): the first saga matching `(name, group_id)`.
+    async fn get_saga_by_name(
+        &self,
+        name: &str,
+        group_id: &str,
+    ) -> Result<Option<SagaNode>, DriverError> {
+        let g = lock!(self)?;
+        Ok(g.saga_nodes
+            .values()
+            .find(|s| s.name == name && s.group_id == group_id)
+            .cloned())
+    }
+
+    /// Saga by UUID (R9 `SagaNode.get_by_uuid`, used by `summarize_saga`).
+    async fn get_saga_by_uuid(&self, uuid: &str) -> Result<Option<SagaNode>, DriverError> {
+        let g = lock!(self)?;
+        Ok(g.saga_nodes.get(uuid).cloned())
+    }
+
+    /// Most-recent prior episode in a saga (R9): of the saga's HAS_EPISODE
+    /// episodes (excluding `current_episode_uuid`), the one with the greatest
+    /// `valid_at` (then `created_at`) — mirrors `ORDER BY valid_at DESC,
+    /// created_at DESC LIMIT 1`.
+    async fn saga_previous_episode_uuid(
+        &self,
+        saga_uuid: &str,
+        current_episode_uuid: &str,
+    ) -> Result<Option<String>, DriverError> {
+        let g = lock!(self)?;
+        let mut candidates: Vec<&EpisodicNode> = g
+            .has_episode_edges
+            .iter()
+            .filter(|e| {
+                e.source_node_uuid == saga_uuid && e.target_node_uuid != current_episode_uuid
+            })
+            .filter_map(|e| g.episodic_nodes.get(&e.target_node_uuid))
+            .collect();
+        // DESC by (valid_at, created_at); pick the first.
+        candidates.sort_by(|a, b| {
+            b.valid_at
+                .cmp(&a.valid_at)
+                .then_with(|| b.created_at.cmp(&a.created_at))
+        });
+        Ok(candidates.first().map(|e| e.uuid.clone()))
+    }
+
+    /// `(content, valid_at)` per saga episode for summarization (R9). When `since`
+    /// is `Some`, filters `created_at > since`; returns chronological order
+    /// (`valid_at ASC, created_at ASC`); truncated to `limit`.
+    async fn saga_episode_contents(
+        &self,
+        saga_uuid: &str,
+        since: Option<DateTime<Utc>>,
+        limit: usize,
+    ) -> Result<Vec<(String, DateTime<Utc>)>, DriverError> {
+        let g = lock!(self)?;
+        let mut eps: Vec<&EpisodicNode> = g
+            .has_episode_edges
+            .iter()
+            .filter(|e| e.source_node_uuid == saga_uuid)
+            .filter_map(|e| g.episodic_nodes.get(&e.target_node_uuid))
+            .filter(|ep| since.is_none_or(|s| ep.created_at > s))
+            .collect();
+        eps.sort_by(|a, b| {
+            a.valid_at
+                .cmp(&b.valid_at)
+                .then_with(|| a.created_at.cmp(&b.created_at))
+        });
+        Ok(eps
+            .into_iter()
+            .take(limit)
+            .map(|ep| (ep.content.clone(), ep.valid_at))
+            .collect())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1560,5 +2058,468 @@ mod tests {
             .unwrap();
         assert_eq!(g1_only.len(), 1);
         assert_eq!(g1_only[0].uuid, "ep1");
+    }
+
+    // ==================================================================
+    // Phase-4: Community ops
+    // ==================================================================
+
+    fn make_community(uuid: &str, name: &str, group_id: &str) -> CommunityNode {
+        let mut c = CommunityNode::new(name.into(), group_id.into(), Utc::now());
+        c.uuid = uuid.into();
+        c
+    }
+
+    fn make_saga(uuid: &str, name: &str, group_id: &str) -> SagaNode {
+        let mut s = SagaNode::new(name.into(), group_id.into(), Utc::now());
+        s.uuid = uuid.into();
+        s
+    }
+
+    #[tokio::test]
+    async fn community_save_and_get_by_group_and_uuid() {
+        let driver = FakeDriver::new();
+        let c1 = make_community("c1", "Tech", "g1");
+        let c2 = make_community("c2", "Finance", "g2");
+        driver.save_community_nodes(&[c1, c2]).await.unwrap();
+
+        let g1 = driver
+            .get_community_nodes_by_group_ids(&["g1".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(g1.len(), 1);
+        assert_eq!(g1[0].uuid, "c1");
+
+        let by_uuid = driver
+            .get_community_nodes_by_uuids(&["c2".to_string(), "missing".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(by_uuid.len(), 1);
+        assert_eq!(by_uuid[0].uuid, "c2");
+
+        // Empty group_ids → empty (upstream semantics).
+        let none = driver.get_community_nodes_by_group_ids(&[]).await.unwrap();
+        assert!(none.is_empty());
+    }
+
+    #[tokio::test]
+    async fn community_fulltext_substring_and_group_filter() {
+        let driver = FakeDriver::new();
+        driver
+            .save_community_nodes(&[
+                make_community("c1", "Tech Companies", "g1"),
+                make_community("c2", "Finance Sector", "g2"),
+            ])
+            .await
+            .unwrap();
+
+        let all = driver
+            .community_fulltext_search("tech", &[], 10)
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].uuid, "c1");
+
+        let scoped = driver
+            .community_fulltext_search("sector", &["g1".to_string()], 10)
+            .await
+            .unwrap();
+        assert!(scoped.is_empty(), "c2 is in g2, excluded by g1 filter");
+    }
+
+    #[tokio::test]
+    async fn community_similarity_ranks_and_skips_no_embedding() {
+        let driver = FakeDriver::new();
+        let emb = MockEmbedder::new(8);
+
+        let mut alpha = make_community("c-alpha", "alpha", "g1");
+        alpha.name_embedding = Some(emb.create("alpha").await.unwrap());
+        let mut beta = make_community("c-beta", "beta", "g1");
+        beta.name_embedding = Some(emb.create("beta").await.unwrap());
+        let no_emb = make_community("c-none", "gamma", "g1");
+        driver
+            .save_community_nodes(&[alpha, beta, no_emb])
+            .await
+            .unwrap();
+
+        let qv = emb.create("alpha").await.unwrap();
+        let results = driver
+            .community_similarity_search(&qv, &[], 10, 0.0)
+            .await
+            .unwrap();
+        assert!(results.iter().all(|c| c.uuid != "c-none"));
+        assert_eq!(results[0].uuid, "c-alpha");
+    }
+
+    #[tokio::test]
+    async fn community_embeddings_loader_omits_missing() {
+        let driver = FakeDriver::new();
+        let emb = MockEmbedder::new(8);
+        let mut with = make_community("cw", "with", "g1");
+        with.name_embedding = Some(emb.create("with").await.unwrap());
+        let without = make_community("cx", "without", "g1");
+        driver.save_community_nodes(&[with, without]).await.unwrap();
+
+        let map = driver
+            .get_embeddings_for_communities(&["cw".to_string(), "cx".to_string()])
+            .await
+            .unwrap();
+        assert!(map.contains_key("cw"));
+        assert!(!map.contains_key("cx"));
+    }
+
+    #[tokio::test]
+    async fn remove_communities_clears_nodes_and_edges() {
+        let driver = FakeDriver::new();
+        driver
+            .save_community_nodes(&[make_community("c1", "Tech", "g1")])
+            .await
+            .unwrap();
+        let edge = CommunityEdge::new("c1".into(), "n1".into(), "g1".into(), Utc::now());
+        driver.save_community_edges(&[edge]).await.unwrap();
+
+        driver.remove_communities().await.unwrap();
+        let nodes = driver
+            .get_community_nodes_by_group_ids(&["g1".to_string()])
+            .await
+            .unwrap();
+        assert!(nodes.is_empty());
+        // membership lookup now finds nothing
+        let mem = driver.community_of_member("n1").await.unwrap();
+        assert!(mem.is_none());
+    }
+
+    #[tokio::test]
+    async fn community_clusters_projection_shape() {
+        let driver = FakeDriver::new();
+        // g1: a-b (2 edges) and a-c (1 edge); g2: standalone d.
+        let a = make_node("a", "A", "g1");
+        let b = make_node("b", "B", "g1");
+        let c = make_node("c", "C", "g1");
+        let d = make_node("d", "D", "g2");
+        driver.save_entity_nodes(&[a, b, c, d]).await.unwrap();
+        driver
+            .save_entity_edges(&[
+                make_edge("ab1", "a", "b", "REL", "f", "g1"),
+                make_edge("ab2", "a", "b", "REL", "f", "g1"),
+                make_edge("ac", "a", "c", "REL", "f", "g1"),
+            ])
+            .await
+            .unwrap();
+
+        let clusters = driver
+            .get_community_clusters(&["g1".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(clusters.len(), 1);
+        assert_eq!(clusters[0].group_id, "g1");
+        // node "a" has neighbours b (count 2) and c (count 1)
+        let a_proj = clusters[0]
+            .nodes
+            .iter()
+            .find(|n| n.node_uuid == "a")
+            .expect("node a present");
+        let b_n = a_proj
+            .neighbors
+            .iter()
+            .find(|n| n.node_uuid == "b")
+            .unwrap();
+        let c_n = a_proj
+            .neighbors
+            .iter()
+            .find(|n| n.node_uuid == "c")
+            .unwrap();
+        assert_eq!(b_n.edge_count, 2, "a-b has 2 RELATES_TO edges");
+        assert_eq!(c_n.edge_count, 1, "a-c has 1 RELATES_TO edge");
+
+        // Empty group_ids → all distinct entity group_ids projected.
+        let all = driver.get_community_clusters(&[]).await.unwrap();
+        let gids: Vec<&str> = all.iter().map(|p| p.group_id.as_str()).collect();
+        assert!(gids.contains(&"g1"));
+        assert!(gids.contains(&"g2"));
+    }
+
+    #[tokio::test]
+    async fn membership_already_member_vs_neighbor_vote() {
+        let driver = FakeDriver::new();
+        // Entities a, b, x; community c1 has member a; a RELATES_TO x.
+        driver
+            .save_entity_nodes(&[
+                make_node("a", "A", "g1"),
+                make_node("b", "B", "g1"),
+                make_node("x", "X", "g1"),
+            ])
+            .await
+            .unwrap();
+        driver
+            .save_community_nodes(&[make_community("c1", "C1", "g1")])
+            .await
+            .unwrap();
+        driver
+            .save_community_edges(&[CommunityEdge::new(
+                "c1".into(),
+                "a".into(),
+                "g1".into(),
+                Utc::now(),
+            )])
+            .await
+            .unwrap();
+        driver
+            .save_entity_edges(&[make_edge("ax", "a", "x", "REL", "f", "g1")])
+            .await
+            .unwrap();
+
+        // a is already a member of c1
+        let mem = driver.community_of_member("a").await.unwrap().unwrap();
+        assert_eq!(mem.uuid, "c1");
+
+        // x is NOT a member; its neighbour a belongs to c1 → neighbour-vote row
+        assert!(driver.community_of_member("x").await.unwrap().is_none());
+        let votes = driver.neighbor_communities("x").await.unwrap();
+        assert_eq!(votes.len(), 1, "one row per neighbour-community membership");
+        assert_eq!(votes[0].uuid, "c1");
+    }
+
+    #[tokio::test]
+    async fn neighbor_communities_emits_row_per_neighbor_not_deduped() {
+        let driver = FakeDriver::new();
+        // x's neighbours a and b are BOTH members of c1 → two rows for c1.
+        driver
+            .save_entity_nodes(&[
+                make_node("a", "A", "g1"),
+                make_node("b", "B", "g1"),
+                make_node("x", "X", "g1"),
+            ])
+            .await
+            .unwrap();
+        driver
+            .save_community_nodes(&[make_community("c1", "C1", "g1")])
+            .await
+            .unwrap();
+        driver
+            .save_community_edges(&[
+                CommunityEdge::new("c1".into(), "a".into(), "g1".into(), Utc::now()),
+                CommunityEdge::new("c1".into(), "b".into(), "g1".into(), Utc::now()),
+            ])
+            .await
+            .unwrap();
+        driver
+            .save_entity_edges(&[
+                make_edge("xa", "x", "a", "REL", "f", "g1"),
+                make_edge("xb", "x", "b", "REL", "f", "g1"),
+            ])
+            .await
+            .unwrap();
+
+        let votes = driver.neighbor_communities("x").await.unwrap();
+        assert_eq!(votes.len(), 2, "NOT deduped: one row per neighbour vote");
+        assert!(votes.iter().all(|c| c.uuid == "c1"));
+    }
+
+    // ==================================================================
+    // Phase-4: Saga ops
+    // ==================================================================
+
+    #[tokio::test]
+    async fn saga_get_by_name_scopes_group() {
+        let driver = FakeDriver::new();
+        driver
+            .save_saga_node(&make_saga("s1", "onboarding", "g1"))
+            .await
+            .unwrap();
+        driver
+            .save_saga_node(&make_saga("s2", "onboarding", "g2"))
+            .await
+            .unwrap();
+
+        let hit = driver
+            .get_saga_by_name("onboarding", "g1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(hit.uuid, "s1");
+        assert!(
+            driver
+                .get_saga_by_name("missing", "g1")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn saga_previous_episode_picks_latest_by_valid_at() {
+        let driver = FakeDriver::new();
+        let t1 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let t2 = Utc.with_ymd_and_hms(2026, 1, 2, 0, 0, 0).unwrap();
+        let t3 = Utc.with_ymd_and_hms(2026, 1, 3, 0, 0, 0).unwrap();
+        for (uuid, t) in [("e1", t1), ("e2", t2), ("e3", t3)] {
+            driver
+                .save_episode(&make_episode(uuid, "g1", EpisodeType::Message, t))
+                .await
+                .unwrap();
+        }
+        driver
+            .save_saga_node(&make_saga("s1", "saga", "g1"))
+            .await
+            .unwrap();
+        for uuid in ["e1", "e2", "e3"] {
+            driver
+                .save_has_episode_edge(&HasEpisodeEdge::new(
+                    "s1".into(),
+                    uuid.into(),
+                    "g1".into(),
+                    Utc::now(),
+                ))
+                .await
+                .unwrap();
+        }
+
+        // current = e3 → previous should be e2 (latest valid_at among the rest)
+        let prev = driver.saga_previous_episode_uuid("s1", "e3").await.unwrap();
+        assert_eq!(prev.as_deref(), Some("e2"));
+    }
+
+    #[tokio::test]
+    async fn saga_episode_contents_since_filters_and_orders() {
+        let driver = FakeDriver::new();
+        let v1 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let v2 = Utc.with_ymd_and_hms(2026, 1, 2, 0, 0, 0).unwrap();
+        // created_at watermark
+        let c_old = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let c_new = Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
+
+        let mut e_old = make_episode("e-old", "g1", EpisodeType::Message, v1);
+        e_old.created_at = c_old;
+        e_old.content = "old content".into();
+        let mut e_new = make_episode("e-new", "g1", EpisodeType::Message, v2);
+        e_new.created_at = c_new;
+        e_new.content = "new content".into();
+        driver.save_episode(&e_old).await.unwrap();
+        driver.save_episode(&e_new).await.unwrap();
+
+        driver
+            .save_saga_node(&make_saga("s1", "saga", "g1"))
+            .await
+            .unwrap();
+        for uuid in ["e-old", "e-new"] {
+            driver
+                .save_has_episode_edge(&HasEpisodeEdge::new(
+                    "s1".into(),
+                    uuid.into(),
+                    "g1".into(),
+                    Utc::now(),
+                ))
+                .await
+                .unwrap();
+        }
+
+        // since just after c_old → only e-new (created_at > since)
+        let since = Utc.with_ymd_and_hms(2026, 3, 1, 0, 0, 0).unwrap();
+        let filtered = driver
+            .saga_episode_contents("s1", Some(since), 200)
+            .await
+            .unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].0, "new content");
+
+        // no watermark → both, chronological by valid_at
+        let all = driver.saga_episode_contents("s1", None, 200).await.unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].0, "old content");
+        assert_eq!(all[1].0, "new content");
+    }
+
+    // ==================================================================
+    // Phase-4: maintenance (get_mentioned_nodes + deletes)
+    // ==================================================================
+
+    #[tokio::test]
+    async fn get_mentioned_nodes_from_mentions_targets() {
+        let driver = FakeDriver::new();
+        driver
+            .save_entity_nodes(&[make_node("n1", "N1", "g1"), make_node("n2", "N2", "g1")])
+            .await
+            .unwrap();
+        let ep = make_episode("ep1", "g1", EpisodeType::Message, Utc::now());
+        driver.save_episode(&ep).await.unwrap();
+        driver
+            .save_episodic_edges(&[
+                EpisodicEdge::new("ep1".into(), "n1".into(), "g1".into(), Utc::now()),
+                EpisodicEdge::new("ep1".into(), "n2".into(), "g1".into(), Utc::now()),
+            ])
+            .await
+            .unwrap();
+
+        let mentioned = driver
+            .get_mentioned_nodes(&["ep1".to_string()])
+            .await
+            .unwrap();
+        let mut uuids: Vec<String> = mentioned.iter().map(|n| n.uuid.clone()).collect();
+        uuids.sort();
+        assert_eq!(uuids, vec!["n1".to_string(), "n2".to_string()]);
+
+        // empty input → empty
+        assert!(driver.get_mentioned_nodes(&[]).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_entity_edges_and_nodes_and_episode() {
+        let driver = FakeDriver::new();
+        driver
+            .save_entity_nodes(&[make_node("n1", "N1", "g1")])
+            .await
+            .unwrap();
+        driver
+            .save_entity_edges(&[make_edge("e1", "n1", "n2", "REL", "f", "g1")])
+            .await
+            .unwrap();
+        let ep = make_episode("ep1", "g1", EpisodeType::Message, Utc::now());
+        driver.save_episode(&ep).await.unwrap();
+        driver
+            .save_episodic_edges(&[EpisodicEdge::new(
+                "ep1".into(),
+                "n1".into(),
+                "g1".into(),
+                Utc::now(),
+            )])
+            .await
+            .unwrap();
+
+        driver
+            .delete_entity_edges_by_uuids(&["e1".to_string()])
+            .await
+            .unwrap();
+        assert!(driver.get_entity_edge("e1").await.unwrap().is_none());
+
+        driver
+            .delete_entity_nodes_by_uuids(&["n1".to_string()])
+            .await
+            .unwrap();
+        assert!(driver.get_entity_node("n1").await.unwrap().is_none());
+        // its MENTIONS edge is gone too
+        assert_eq!(driver.episodic_edge_count(), 0);
+
+        driver.delete_episode("ep1").await.unwrap();
+        assert!(driver.get_episode("ep1").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn get_entity_edges_by_uuids_preserves_order() {
+        let driver = FakeDriver::new();
+        driver
+            .save_entity_edges(&[
+                make_edge("e1", "a", "b", "REL", "f1", "g1"),
+                make_edge("e2", "a", "c", "REL", "f2", "g1"),
+            ])
+            .await
+            .unwrap();
+        let got = driver
+            .get_entity_edges_by_uuids(&["e2".to_string(), "e1".to_string(), "miss".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].uuid, "e2");
+        assert_eq!(got[1].uuid, "e1");
     }
 }

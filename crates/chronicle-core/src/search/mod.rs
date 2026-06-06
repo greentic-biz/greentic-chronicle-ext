@@ -6,8 +6,10 @@
 //   full reranker enums (Mmr/NodeDistance/EpisodeMentions/CrossEncoder),
 //   BFS traversal in method enums, complete recipe set.
 //
-// Community scope deferred to Phase 4 (ledger note in config.rs / recipes.rs).
+// Phase-4 additions: community scope (CommunitySearchConfig, community_search,
+//   COMMUNITY_* / COMBINED_* community recipes, SearchResults.communities).
 
+pub mod community_search;
 pub mod config;
 pub mod edge_search;
 pub mod episode_search;
@@ -22,6 +24,9 @@ pub mod search;
 
 // ── config re-exports ────────────────────────────────────────────────────────
 pub use config::{
+    CommunityReranker,
+    CommunitySearchConfig,
+    CommunitySearchMethod,
     DEFAULT_MIN_SCORE,
     DEFAULT_MMR_LAMBDA,
     DEFAULT_SEARCH_LIMIT,
@@ -46,13 +51,15 @@ pub use filters::{ComparisonOperator, DateFilter, PropertyFilter, SearchFilters}
 // ── recipes re-exports ────────────────────────────────────────────────────────
 pub use recipes::{
     combined_hybrid_search_cross_encoder, combined_hybrid_search_mmr, combined_hybrid_search_rrf,
-    edge_hybrid_search_cross_encoder, edge_hybrid_search_episode_mentions, edge_hybrid_search_mmr,
-    edge_hybrid_search_node_distance, node_hybrid_search_cross_encoder,
-    node_hybrid_search_episode_mentions, node_hybrid_search_mmr, node_hybrid_search_node_distance,
-    node_hybrid_search_rrf,
+    community_hybrid_search_cross_encoder, community_hybrid_search_mmr,
+    community_hybrid_search_rrf, edge_hybrid_search_cross_encoder,
+    edge_hybrid_search_episode_mentions, edge_hybrid_search_mmr, edge_hybrid_search_node_distance,
+    node_hybrid_search_cross_encoder, node_hybrid_search_episode_mentions, node_hybrid_search_mmr,
+    node_hybrid_search_node_distance, node_hybrid_search_rrf,
 };
 
 // ── search function re-exports ────────────────────────────────────────────────
+pub use community_search::community_search;
 pub use edge_search::{edge_search, edge_search_simple};
 pub use episode_search::episode_search;
 pub use node_search::node_search;

@@ -1,18 +1,16 @@
 // Ported from graphiti_core/search/search_config.py::SearchResults @ 34f56e65.
 //
-// DIVERGENCE (ledger note): upstream `SearchResults` carries `communities` +
-// `community_reranker_scores`. The community scope is DEFERRED to Phase 4 (see
-// search/config.rs + recipes.rs notes); the community fields are OMITTED from
-// this struct in Phase 2 and will be added when the community scope lands. All
-// other fields mirror upstream 1:1.
+// Phase-4: the community scope landed; `communities` + `community_reranker_scores`
+// are now present (default-empty), so this struct mirrors upstream 1:1. The
+// Phase-2 "communities omitted" ledger note is hereby removed.
 
-use crate::types::{EntityEdge, EntityNode, EpisodicNode};
+use crate::types::{CommunityNode, EntityEdge, EntityNode, EpisodicNode};
 
 /// Aggregated multi-scope search results.
 ///
 /// Upstream: `SearchResults` model. Each result vector is paired with its
 /// reranker score vector (same length / order as produced by the per-scope
-/// search). Community fields are deferred to Phase 4.
+/// search).
 #[derive(Debug, Default, Clone)]
 pub struct SearchResults {
     /// Reranked entity edges (edge scope).
@@ -27,7 +25,10 @@ pub struct SearchResults {
     pub episodes: Vec<EpisodicNode>,
     /// Reranker scores aligned to `episodes`.
     pub episode_reranker_scores: Vec<f64>,
-    // community fields deferred to Phase 4 (upstream community scope) — ledger
+    /// Reranked communities (community scope). Phase-4 addition.
+    pub communities: Vec<CommunityNode>,
+    /// Reranker scores aligned to `communities`. Phase-4 addition.
+    pub community_reranker_scores: Vec<f64>,
 }
 
 #[cfg(test)]
@@ -43,5 +44,7 @@ mod tests {
         assert!(r.node_reranker_scores.is_empty());
         assert!(r.episodes.is_empty());
         assert!(r.episode_reranker_scores.is_empty());
+        assert!(r.communities.is_empty());
+        assert!(r.community_reranker_scores.is_empty());
     }
 }

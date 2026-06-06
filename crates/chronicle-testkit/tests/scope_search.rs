@@ -18,18 +18,24 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use async_trait::async_trait;
 use chrono::Utc;
 
-use chronicle_core::driver::{EntityEdgeOps, EntityNodeOps, EpisodeOps, EpisodicEdgeOps};
+use chronicle_core::driver::{
+    CommunityOps, EntityEdgeOps, EntityNodeOps, EpisodeOps, EpisodicEdgeOps,
+};
 use chronicle_core::embedder::{EmbedderClient, EmbedderError};
+use chronicle_core::search::community_search::community_search;
 use chronicle_core::search::config::{
-    EdgeReranker, EdgeSearchConfig, EdgeSearchMethod, EpisodeReranker, EpisodeSearchConfig,
-    EpisodeSearchMethod, NodeReranker, NodeSearchConfig, NodeSearchMethod, SearchConfig,
+    CommunityReranker, CommunitySearchConfig, CommunitySearchMethod, EdgeReranker,
+    EdgeSearchConfig, EdgeSearchMethod, EpisodeReranker, EpisodeSearchConfig, EpisodeSearchMethod,
+    NodeReranker, NodeSearchConfig, NodeSearchMethod, SearchConfig,
 };
 use chronicle_core::search::edge_search::edge_search;
 use chronicle_core::search::episode_search::episode_search;
 use chronicle_core::search::filters::SearchFilters;
 use chronicle_core::search::node_search::node_search;
 use chronicle_core::search::search::search;
-use chronicle_core::types::{EntityEdge, EntityNode, EpisodeType, EpisodicEdge, EpisodicNode};
+use chronicle_core::types::{
+    CommunityNode, EntityEdge, EntityNode, EpisodeType, EpisodicEdge, EpisodicNode,
+};
 
 use chronicle_testkit::{FakeDriver, MockCrossEncoder, MockEmbedder};
 
@@ -107,6 +113,27 @@ fn edge_cfg(methods: Vec<EdgeSearchMethod>, reranker: EdgeReranker) -> EdgeSearc
         search_methods: methods,
         reranker,
         sim_min_score: 0.0,
+        mmr_lambda: 0.5,
+        bfs_max_depth: 3,
+    }
+}
+
+fn community(uuid: &str, name: &str, group: &str) -> CommunityNode {
+    let mut c = CommunityNode::new(name.into(), group.into(), Utc::now());
+    c.uuid = uuid.into();
+    c
+}
+
+fn community_cfg(
+    methods: Vec<CommunitySearchMethod>,
+    reranker: CommunityReranker,
+) -> CommunitySearchConfig {
+    CommunitySearchConfig {
+        search_methods: methods,
+        reranker,
+        // Low threshold so the always-on similarity search does not reject
+        // seeded embeddings in driver-backed tests.
+        sim_min_score: -1.0,
         mmr_lambda: 0.5,
         bfs_max_depth: 3,
     }
@@ -559,10 +586,10 @@ async fn episode_cross_encoder_ranks_content() {
     assert_eq!(episodes[0].uuid, "ep1", "higher cross-encoder score first");
 }
 
-// ── top-level: multi-scope assembly ──────────────────────────────────────────
+// ── top-level: multi-scope assembly (4 scopes incl. community) ────────────────
 
 #[tokio::test]
-async fn top_level_search_assembles_all_three_scopes() {
+async fn top_level_search_assembles_all_four_scopes() {
     let driver = FakeDriver::new();
     let n = node("n1", "alpha node", "g1");
     driver.save_entity_nodes(&[n]).await.unwrap();
@@ -570,6 +597,10 @@ async fn top_level_search_assembles_all_three_scopes() {
     driver.save_entity_edges(&[e]).await.unwrap();
     let ep = episode("ep1", "alpha episode", "g1");
     driver.save_episode(&ep).await.unwrap();
+    // Seed a community whose NAME contains the query term so the always-on
+    // community_fulltext_search returns it.
+    let c = community("c1", "alpha community", "g1");
+    driver.save_community_nodes(&[c]).await.unwrap();
 
     let cfg = SearchConfig {
         edge_config: Some(edge_cfg(vec![EdgeSearchMethod::Bm25], EdgeReranker::Rrf)),
@@ -587,6 +618,10 @@ async fn top_level_search_assembles_all_three_scopes() {
             mmr_lambda: 0.5,
             bfs_max_depth: 3,
         }),
+        community_config: Some(community_cfg(
+            vec![CommunitySearchMethod::Bm25],
+            CommunityReranker::Rrf,
+        )),
         limit: 10,
         reranker_min_score: 0.0,
     };
@@ -608,6 +643,9 @@ async fn top_level_search_assembles_all_three_scopes() {
     assert_eq!(results.edges.len(), 1);
     assert_eq!(results.nodes.len(), 1);
     assert_eq!(results.episodes.len(), 1);
+    assert_eq!(results.communities.len(), 1, "community scope populated");
+    assert_eq!(results.communities[0].uuid, "c1");
+    assert_eq!(results.community_reranker_scores.len(), 1);
 }
 
 // ── top-level: empty query guard ─────────────────────────────────────────────
@@ -622,6 +660,7 @@ async fn top_level_empty_query_returns_default() {
         edge_config: Some(edge_cfg(vec![EdgeSearchMethod::Bm25], EdgeReranker::Rrf)),
         node_config: None,
         episode_config: None,
+        community_config: None,
         limit: 10,
         reranker_min_score: 0.0,
     };
@@ -667,6 +706,7 @@ async fn top_level_no_cosine_or_mmr_skips_embedding() {
             mmr_lambda: 0.5,
             bfs_max_depth: 3,
         }),
+        community_config: None,
         limit: 10,
         reranker_min_score: 0.0,
     };
@@ -705,6 +745,7 @@ async fn top_level_cosine_scope_embeds_once() {
         )),
         node_config: None,
         episode_config: None,
+        community_config: None,
         limit: 10,
         reranker_min_score: 0.0,
     };
@@ -742,6 +783,7 @@ async fn top_level_empty_group_id_string_is_no_filter() {
         edge_config: Some(edge_cfg(vec![EdgeSearchMethod::Bm25], EdgeReranker::Rrf)),
         node_config: None,
         episode_config: None,
+        community_config: None,
         limit: 10,
         reranker_min_score: 0.0,
     };
@@ -763,4 +805,241 @@ async fn top_level_empty_group_id_string_is_no_filter() {
     let uuids: Vec<&str> = results.edges.iter().map(|e| e.uuid.as_str()).collect();
     assert_eq!(results.edges.len(), 2, "both groups returned (no filter)");
     assert!(uuids.contains(&"ea") && uuids.contains(&"eb"));
+}
+
+// ── community: RRF fuses fulltext + similarity (both methods always run) ──────
+
+#[tokio::test]
+async fn community_rrf_fuses_both_methods() {
+    let driver = FakeDriver::new();
+    let emb = MockEmbedder::new(8);
+    let q = "alpha";
+
+    // c_both: matches BOTH fulltext (name contains "alpha") AND similarity
+    // (embedding == query) → ranks first under RRF.
+    let mut c_both = community("c_both", "alpha team", "g1");
+    c_both.name_embedding = Some(emb.create(q).await.unwrap());
+    // c_text: fulltext only (name contains "alpha", no embedding).
+    let c_text = community("c_text", "alpha squad", "g1");
+    // c_vec: similarity only (name has no "alpha", embedding == query).
+    let mut c_vec = community("c_vec", "unrelated cluster", "g1");
+    c_vec.name_embedding = Some(emb.create(q).await.unwrap());
+    driver
+        .save_community_nodes(&[c_both, c_text, c_vec])
+        .await
+        .unwrap();
+
+    let qv = emb.create(q).await.unwrap();
+    let cfg = community_cfg(
+        vec![
+            CommunitySearchMethod::Bm25,
+            CommunitySearchMethod::CosineSimilarity,
+        ],
+        CommunityReranker::Rrf,
+    );
+    let (communities, scores) =
+        community_search(&driver, None, q, &qv, &["g1".into()], Some(&cfg), 10, 0.0)
+            .await
+            .unwrap();
+
+    let uuids: Vec<&str> = communities.iter().map(|c| c.uuid.as_str()).collect();
+    assert!(
+        uuids.contains(&"c_both") && uuids.contains(&"c_text") && uuids.contains(&"c_vec"),
+        "all three appear (order {uuids:?})"
+    );
+    assert_eq!(
+        communities[0].uuid, "c_both",
+        "community present in both result lists → top RRF"
+    );
+    assert!(scores[0] >= scores[1]);
+}
+
+// ── community: both methods run even when search_methods lists only one ───────
+
+#[tokio::test]
+async fn community_runs_both_methods_regardless_of_methods_list() {
+    // UPSTREAM QUIRK: community_search always runs fulltext + similarity. Here
+    // the config lists ONLY bm25, yet a similarity-only hit must still surface.
+    let driver = FakeDriver::new();
+    let emb = MockEmbedder::new(8);
+    let q = "alpha";
+
+    let mut c_vec = community("c_vec", "no keyword here", "g1");
+    c_vec.name_embedding = Some(emb.create(q).await.unwrap());
+    driver.save_community_nodes(&[c_vec]).await.unwrap();
+
+    let qv = emb.create(q).await.unwrap();
+    // Only bm25 in the methods list — similarity should STILL run.
+    let cfg = community_cfg(vec![CommunitySearchMethod::Bm25], CommunityReranker::Rrf);
+    let (communities, _scores) =
+        community_search(&driver, None, q, &qv, &["g1".into()], Some(&cfg), 10, 0.0)
+            .await
+            .unwrap();
+
+    let uuids: Vec<&str> = communities.iter().map(|c| c.uuid.as_str()).collect();
+    assert!(
+        uuids.contains(&"c_vec"),
+        "similarity-only hit surfaces despite bm25-only methods list (quirk)"
+    );
+}
+
+// ── community: MMR ordering with seeded embeddings ────────────────────────────
+
+#[tokio::test]
+async fn community_mmr_orders_by_relevance_lambda_one() {
+    // lambda=1.0 → pure relevance; query aligned with c_near. Similarity search
+    // returns all three (min_score=-1.0); MMR reloads name_embedding and orders.
+    let driver = FakeDriver::new();
+    let mut c_near = community("c_near", "near", "g1");
+    c_near.name_embedding = Some(vec![1.0, 0.0]);
+    let mut c_mid = community("c_mid", "mid", "g1");
+    c_mid.name_embedding = Some(vec![1.0, 1.0]);
+    let mut c_far = community("c_far", "far", "g1");
+    c_far.name_embedding = Some(vec![0.0, 1.0]);
+    driver
+        .save_community_nodes(&[c_near, c_mid, c_far])
+        .await
+        .unwrap();
+
+    let qv = vec![1.0_f32, 0.0];
+    let cfg = CommunitySearchConfig {
+        search_methods: vec![CommunitySearchMethod::CosineSimilarity],
+        reranker: CommunityReranker::Mmr,
+        sim_min_score: -1.0,
+        mmr_lambda: 1.0,
+        bfs_max_depth: 3,
+    };
+    let (communities, _scores) = community_search(
+        &driver,
+        None,
+        "q",
+        &qv,
+        &["g1".into()],
+        Some(&cfg),
+        10,
+        -2.0,
+    )
+    .await
+    .unwrap();
+
+    let order: Vec<&str> = communities.iter().map(|c| c.uuid.as_str()).collect();
+    assert_eq!(order, vec!["c_near", "c_mid", "c_far"]);
+}
+
+// ── community: cross_encoder ranks NAMES + min_score filter ───────────────────
+
+#[tokio::test]
+async fn community_cross_encoder_ranks_names_and_filters_min_score() {
+    let driver = FakeDriver::new();
+    // All three match fulltext on "alpha"; cross_encoder ranks by name.
+    let c1 = community("c1", "alpha relevant", "g1");
+    let c2 = community("c2", "alpha marginal", "g1");
+    let c3 = community("c3", "alpha irrelevant", "g1");
+    driver.save_community_nodes(&[c1, c2, c3]).await.unwrap();
+
+    let ce = MockCrossEncoder::from_pairs([
+        ("alpha relevant", 0.9),
+        ("alpha marginal", 0.5),
+        ("alpha irrelevant", 0.1),
+    ]);
+    let cfg = community_cfg(
+        vec![CommunitySearchMethod::Bm25],
+        CommunityReranker::CrossEncoder,
+    );
+    let (communities, scores) = community_search(
+        &driver,
+        Some(&ce),
+        "alpha",
+        &[],
+        &["g1".into()],
+        Some(&cfg),
+        10,
+        0.4, // min_score filters out c3 (0.1)
+    )
+    .await
+    .unwrap();
+
+    let order: Vec<&str> = communities.iter().map(|c| c.uuid.as_str()).collect();
+    assert_eq!(order, vec!["c1", "c2"], "c3 below min_score → dropped");
+    assert!(scores[0] >= scores[1]);
+}
+
+// ── community: cross_encoder missing encoder → InvalidInput ───────────────────
+
+#[tokio::test]
+async fn community_cross_encoder_missing_client_errors() {
+    let driver = FakeDriver::new();
+    let c = community("c1", "alpha", "g1");
+    driver.save_community_nodes(&[c]).await.unwrap();
+
+    let cfg = community_cfg(
+        vec![CommunitySearchMethod::Bm25],
+        CommunityReranker::CrossEncoder,
+    );
+    let err = community_search(
+        &driver,
+        None,
+        "alpha",
+        &[],
+        &["g1".into()],
+        Some(&cfg),
+        10,
+        0.0,
+    )
+    .await
+    .unwrap_err();
+    assert!(format!("{err}").contains("cross_encoder"));
+}
+
+// ── community: config None → empty ────────────────────────────────────────────
+
+#[tokio::test]
+async fn community_search_none_config_returns_empty() {
+    let driver = FakeDriver::new();
+    let (communities, scores) = community_search(&driver, None, "q", &[], &[], None, 10, 0.0)
+        .await
+        .unwrap();
+    assert!(communities.is_empty() && scores.is_empty());
+}
+
+// ── top-level: community-only cosine config triggers the embed decision ───────
+
+#[tokio::test]
+async fn top_level_community_cosine_scope_embeds_once() {
+    let driver = FakeDriver::new();
+    let mut c = community("c1", "alpha community", "g1");
+    c.name_embedding = Some(MockEmbedder::new(8).create("alpha").await.unwrap());
+    driver.save_community_nodes(&[c]).await.unwrap();
+
+    // ONLY a community scope, using cosine — no edge/node/episode scopes at all.
+    let cfg = SearchConfig {
+        edge_config: None,
+        node_config: None,
+        episode_config: None,
+        community_config: Some(community_cfg(
+            vec![CommunitySearchMethod::CosineSimilarity],
+            CommunityReranker::Rrf,
+        )),
+        limit: 10,
+        reranker_min_score: 0.0,
+    };
+    let (emb, calls) = CountingEmbedder::new(8);
+    let _ = search(
+        &driver,
+        &emb,
+        None,
+        "alpha",
+        &["g1".into()],
+        &cfg,
+        &SearchFilters::default(),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "community cosine scope → query embedded exactly once"
+    );
 }

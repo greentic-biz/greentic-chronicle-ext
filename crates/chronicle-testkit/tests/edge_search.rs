@@ -145,6 +145,7 @@ async fn edge_search_no_edge_config_returns_empty() {
         edge_config: None,
         node_config: None,
         episode_config: None,
+        community_config: None,
 
         limit: 10,
         reranker_min_score: 0.0,
@@ -183,6 +184,7 @@ async fn edge_search_bm25_only() {
         }),
         node_config: None,
         episode_config: None,
+        community_config: None,
 
         limit: 10,
         reranker_min_score: 0.0,
@@ -228,6 +230,7 @@ async fn edge_search_cosine_only() {
         }),
         node_config: None,
         episode_config: None,
+        community_config: None,
 
         limit: 10,
         reranker_min_score: 0.0,

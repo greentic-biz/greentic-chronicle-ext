@@ -18,7 +18,9 @@
 //!   attribute is a `DriverError::Decode` on write.
 
 use chronicle_core::driver::DriverError;
-use chronicle_core::types::{EntityEdge, EntityNode, EpisodeType, EpisodicEdge, EpisodicNode};
+use chronicle_core::types::{
+    CommunityNode, EntityEdge, EntityNode, EpisodeType, EpisodicEdge, EpisodicNode, SagaNode,
+};
 use chrono::{DateTime, FixedOffset, Utc};
 use neo4rs::{BoltList, BoltMap, BoltNull, BoltString, BoltType, Row};
 use serde_json::{Map, Number, Value};
@@ -554,6 +556,134 @@ pub fn episodic_node_from_row(row: &Row) -> Result<EpisodicNode, DriverError> {
         created_at: read_datetime(row, "created_at")?,
         valid_at: read_datetime(row, "valid_at")?,
     })
+}
+
+// ---------------------------------------------------------------------
+// Community + Saga conversions (Phase-4)
+// ---------------------------------------------------------------------
+
+/// Build the `{uuid, props, name_embedding}` map for one community node, mirroring
+/// the entity-node save-data shape. `props` holds the scalar fields (uuid / name /
+/// group_id / summary / created_at); `name_embedding` is set separately via the
+/// vector procedure (with the null guard in [`SAVE_COMMUNITY_NODES`]).
+pub fn community_node_to_bolt(node: &CommunityNode) -> BoltType {
+    let mut props = BoltMap::new();
+    props.put(BoltString::new("uuid"), BoltType::from(node.uuid.as_str()));
+    props.put(BoltString::new("name"), BoltType::from(node.name.as_str()));
+    props.put(
+        BoltString::new("group_id"),
+        BoltType::from(node.group_id.as_str()),
+    );
+    props.put(
+        BoltString::new("summary"),
+        BoltType::from(node.summary.as_str()),
+    );
+    props.put(
+        BoltString::new("created_at"),
+        datetime_to_bolt(node.created_at),
+    );
+
+    let mut outer = BoltMap::new();
+    outer.put(BoltString::new("uuid"), BoltType::from(node.uuid.as_str()));
+    outer.put(BoltString::new("props"), BoltType::Map(props));
+    outer.put(
+        BoltString::new("name_embedding"),
+        opt_embedding_to_bolt(node.name_embedding.as_ref()),
+    );
+    BoltType::Map(outer)
+}
+
+/// Build the `{uuid, source_node_uuid, target_node_uuid, group_id, created_at}`
+/// map for one HAS_MEMBER community edge.
+pub fn community_edge_to_bolt(edge: &chronicle_core::types::CommunityEdge) -> BoltType {
+    let mut map = BoltMap::new();
+    map.put(BoltString::new("uuid"), BoltType::from(edge.uuid.as_str()));
+    map.put(
+        BoltString::new("source_node_uuid"),
+        BoltType::from(edge.source_node_uuid.as_str()),
+    );
+    map.put(
+        BoltString::new("target_node_uuid"),
+        BoltType::from(edge.target_node_uuid.as_str()),
+    );
+    map.put(
+        BoltString::new("group_id"),
+        BoltType::from(edge.group_id.as_str()),
+    );
+    map.put(
+        BoltString::new("created_at"),
+        datetime_to_bolt(edge.created_at),
+    );
+    BoltType::Map(map)
+}
+
+/// Parse a community node from a row projected via `COMMUNITY_NODE_RETURN`.
+pub fn community_node_from_row(row: &Row) -> Result<CommunityNode, DriverError> {
+    Ok(CommunityNode {
+        uuid: read_string(row, "uuid")?,
+        name: read_string(row, "name")?,
+        group_id: read_string(row, "group_id")?,
+        labels: vec!["Community".to_string()],
+        created_at: read_datetime(row, "created_at")?,
+        summary: read_string(row, "summary")?,
+        name_embedding: read_opt_embedding(row, "name_embedding")?,
+    })
+}
+
+/// Parse a saga node from a row projected via `SAGA_NODE_RETURN`.
+pub fn saga_node_from_row(row: &Row) -> Result<SagaNode, DriverError> {
+    Ok(SagaNode {
+        uuid: read_string(row, "uuid")?,
+        name: read_string(row, "name")?,
+        group_id: read_string(row, "group_id")?,
+        labels: vec!["Saga".to_string()],
+        created_at: read_datetime(row, "created_at")?,
+        summary: read_string(row, "summary")?,
+        first_episode_uuid: read_opt_string(row, "first_episode_uuid")?,
+        last_episode_uuid: read_opt_string(row, "last_episode_uuid")?,
+        last_summarized_at: read_opt_datetime(row, "last_summarized_at")?,
+        last_summarized_episode_valid_at: read_opt_datetime(
+            row,
+            "last_summarized_episode_valid_at",
+        )?,
+    })
+}
+
+/// `Option<&str>` → param value (Null when None). Used for the saga node's
+/// optional `first_episode_uuid` / `last_episode_uuid` params.
+pub(crate) fn opt_str_param(value: Option<&str>) -> BoltType {
+    match value {
+        Some(s) => BoltType::from(s),
+        None => BoltType::Null(BoltNull),
+    }
+}
+
+/// `Option<DateTime<Utc>>` → param value (Null when None). Exposed for the saga
+/// node's optional watermark params.
+pub(crate) fn opt_datetime_param(dt: Option<DateTime<Utc>>) -> BoltType {
+    opt_datetime_to_bolt(dt)
+}
+
+/// Read a `(content, valid_at)` pair from a saga episode-contents row.
+pub(crate) fn saga_episode_content_row(row: &Row) -> Result<(String, DateTime<Utc>), DriverError> {
+    let content = read_string(row, "content")?;
+    let valid_at = read_datetime(row, "valid_at")?;
+    Ok((content, valid_at))
+}
+
+/// Read an optional String column (null/absent → None).
+fn read_opt_string(row: &Row, col: &str) -> Result<Option<String>, DriverError> {
+    let bolt: BoltType = match row.get(col) {
+        Ok(b) => b,
+        Err(_) => return Ok(None),
+    };
+    match bolt {
+        BoltType::Null(_) => Ok(None),
+        BoltType::String(s) => Ok(Some(s.value)),
+        other => Err(DriverError::Decode(format!(
+            "expected string for '{col}', got {other:?}"
+        ))),
+    }
 }
 
 #[cfg(test)]

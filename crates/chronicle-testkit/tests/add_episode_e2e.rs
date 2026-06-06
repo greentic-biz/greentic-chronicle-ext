@@ -52,10 +52,7 @@ fn req(name: &str, body: &str, reference_time: DateTime<Utc>) -> AddEpisodeReque
         source_description: "test".to_string(),
         reference_time,
         group_id: "g1".to_string(),
-        uuid: None,
-        previous_episode_uuids: None,
-        entity_types: None,
-        custom_extraction_instructions: None,
+        ..Default::default()
     }
 }
 

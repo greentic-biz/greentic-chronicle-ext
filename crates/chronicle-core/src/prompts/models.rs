@@ -208,6 +208,17 @@ pub struct SummaryDescription {
     pub description: String,
 }
 
+/// Response model for the `summarize_sagas.summarize_saga` prompt.
+///
+/// Port of upstream `SagaSummary` (summarize_sagas.py). The description resolves
+/// the f-string `f'Factual knowledge brief. Under {MAX_SUMMARY_CHARS} characters.'`
+/// to the literal "1000" byte-for-byte (MAX_SUMMARY_CHARS = 1000).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+pub struct SagaSummary {
+    #[schemars(description = "Factual knowledge brief. Under 1000 characters.")]
+    pub summary: String,
+}
+
 // --------------------------------------------------------------------------
 // Tests
 // --------------------------------------------------------------------------

@@ -35,9 +35,10 @@ fn ordered_episode_map(result_lists: &[Vec<EpisodicNode>]) -> HashMap<String, Ep
 /// Episode fulltext (BM25) search with RRF / CrossEncoder reranking.
 ///
 /// Upstream: `graphiti_core/search/search.py::episode_search`. `config` `None`
-/// → `(vec![], vec![])`. `filters` is currently unused by the episode fulltext
-/// driver method (upstream threads SearchFilters into the episode query but the
-/// chronicle `episode_fulltext_search` does not yet take it — see SearchOps).
+/// → `(vec![], vec![])`. `filters` is accepted but unused — faithful to
+/// upstream: `episode_fulltext_search` takes `_search_filter` (underscore =
+/// unused) and DISCARDS it; the param is dead upstream too, so chronicle's
+/// `episode_fulltext_search` driver method omits it entirely.
 #[allow(clippy::too_many_arguments)]
 pub async fn episode_search(
     driver: &dyn GraphDriver,

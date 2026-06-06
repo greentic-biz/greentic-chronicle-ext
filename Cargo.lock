@@ -235,6 +235,7 @@ dependencies = [
  "chronicle-core",
  "chronicle-driver-neo4j",
  "chrono",
+ "futures",
  "schemars",
  "serde",
  "serde_json",

@@ -141,7 +141,7 @@ fn to_response_format(schema: &ResponseSchema) -> ResponseFormat {
 /// * HTTP 5xx → [`LlmError::Server`] (retryable).
 /// * other API errors → [`LlmError::Transport`] (non-retryable).
 /// * transport/deserialize/other SDK errors → [`LlmError::Transport`].
-fn map_openai_error(err: OpenAIError) -> LlmError {
+pub(crate) fn map_openai_error(err: OpenAIError) -> LlmError {
     match err {
         OpenAIError::ApiError(_) => {
             // The `_api` feature exposes the HTTP status via ApiErrorResponse,

@@ -2,6 +2,7 @@
 
 pub mod add_episode;
 pub mod clients;
+pub mod community_ops;
 pub mod dedup_helpers;
 pub mod edge_ops;
 pub mod node_ops;

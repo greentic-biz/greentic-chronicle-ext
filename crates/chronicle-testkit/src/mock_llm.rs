@@ -1,19 +1,49 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 
 use async_trait::async_trait;
 use chronicle_core::llm::{LlmClient, LlmError, LlmRequest};
 
-/// Replays queued JSON responses in order; records incoming requests.
+/// Routing strategy for [`MockLlm`] responses.
+enum Mode {
+    /// FIFO queue: each call pops the next response regardless of prompt.
+    Ordered(VecDeque<serde_json::Value>),
+    /// Keyed by `prompt_name`: each call returns the registered response for its
+    /// prompt name. This decouples scripting from call ORDER, which is essential
+    /// when the pipeline fans out parallel tasks (bulk ingest). A prompt with no
+    /// registered key yields [`LlmError::EmptyResponse`].
+    Keyed(HashMap<String, serde_json::Value>),
+}
+
+/// Replays queued JSON responses; records incoming requests.
+///
+/// Two modes:
+/// - [`MockLlm::new`] — ordered FIFO queue (deterministic only when call order is
+///   deterministic, e.g. concurrency pinned to 1 along a single linear path).
+/// - [`MockLlm::keyed`] — route by `prompt_name`, order-independent. Use this for
+///   the parallel bulk path.
 pub struct MockLlm {
-    responses: Mutex<VecDeque<serde_json::Value>>,
+    mode: Mutex<Mode>,
     pub requests: Mutex<Vec<LlmRequest>>,
 }
 
 impl MockLlm {
     pub fn new(responses: Vec<serde_json::Value>) -> Self {
         Self {
-            responses: Mutex::new(responses.into()),
+            mode: Mutex::new(Mode::Ordered(responses.into())),
+            requests: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Route responses by `prompt_name`. Each entry `(prompt_name, response)` is
+    /// returned for every call whose request carries that `prompt_name`.
+    pub fn keyed(responses: Vec<(&str, serde_json::Value)>) -> Self {
+        let map = responses
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
+        Self {
+            mode: Mutex::new(Mode::Keyed(map)),
             requests: Mutex::new(Vec::new()),
         }
     }
@@ -27,15 +57,22 @@ impl MockLlm {
 #[async_trait]
 impl LlmClient for MockLlm {
     async fn generate(&self, request: LlmRequest) -> Result<serde_json::Value, LlmError> {
+        let prompt_name = request.prompt_name.clone();
         self.requests
             .lock()
             .map_err(|_| LlmError::Transport("poisoned".into()))?
             .push(request);
-        self.responses
+        let mut mode = self
+            .mode
             .lock()
-            .map_err(|_| LlmError::Transport("poisoned".into()))?
-            .pop_front()
-            .ok_or(LlmError::EmptyResponse)
+            .map_err(|_| LlmError::Transport("poisoned".into()))?;
+        match &mut *mode {
+            Mode::Ordered(queue) => queue.pop_front().ok_or(LlmError::EmptyResponse),
+            Mode::Keyed(map) => prompt_name
+                .as_deref()
+                .and_then(|name| map.get(name).cloned())
+                .ok_or(LlmError::EmptyResponse),
+        }
     }
 }
 

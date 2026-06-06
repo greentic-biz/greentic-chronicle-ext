@@ -57,6 +57,24 @@ impl FakeDriver {
             .map(|g| g.episodic_edges.len())
             .unwrap_or(0)
     }
+
+    /// Snapshot of all stored NEXT_EPISODE edges (test inspection).
+    /// Returns an empty vec if the lock is poisoned.
+    pub fn next_episode_edges(&self) -> Vec<NextEpisodeEdge> {
+        self.inner
+            .lock()
+            .map(|g| g.next_episode_edges.clone())
+            .unwrap_or_default()
+    }
+
+    /// Snapshot of all stored HAS_EPISODE edges (test inspection).
+    /// Returns an empty vec if the lock is poisoned.
+    pub fn has_episode_edges(&self) -> Vec<HasEpisodeEdge> {
+        self.inner
+            .lock()
+            .map(|g| g.has_episode_edges.clone())
+            .unwrap_or_default()
+    }
 }
 
 // ---------------------------------------------------------------------------

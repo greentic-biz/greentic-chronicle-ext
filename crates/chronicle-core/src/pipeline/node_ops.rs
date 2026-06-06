@@ -420,7 +420,7 @@ async fn collect_candidate_nodes(
 /// (dedup_helpers.py:220-279). Lives here (rather than in `dedup_helpers.rs`)
 /// because it is the resolution driver, not a pure heuristic primitive; it
 /// composes the `dedup_helpers` primitives.
-fn resolve_with_similarity(
+pub(crate) fn resolve_with_similarity(
     extracted_nodes: &[EntityNode],
     indexes: &DedupCandidateIndexes,
     state: &mut DedupResolutionState,

@@ -75,7 +75,7 @@ use crate::prompts::extract_edges::{
 };
 use crate::prompts::models::{EdgeDuplicate, EdgeTimestamps, ExtractedEdges, Summary};
 use crate::prompts::summarize_nodes::{SummarizeContext, summarize_context};
-use crate::search::{edge_hybrid_search_rrf, edge_search};
+use crate::search::{edge_hybrid_search_rrf, edge_search_simple};
 use crate::types::{EntityEdge, EntityNode, EpisodicNode};
 
 /// Outcome of [`resolve_extracted_edges`].
@@ -274,9 +274,11 @@ pub async fn resolve_extracted_edges(
         let related_uuids: std::collections::HashSet<String> =
             related.iter().map(|e| e.uuid.clone()).collect();
 
-        let invalidation_hits = edge_search(
+        let invalidation_hits = edge_search_simple(
             clients.driver.as_ref(),
             clients.embedder.as_ref(),
+            // Invalidation-candidate search uses the RRF recipe (no cross_encoder).
+            None,
             &edge.fact,
             std::slice::from_ref(&edge.group_id),
             &edge_hybrid_search_rrf(),

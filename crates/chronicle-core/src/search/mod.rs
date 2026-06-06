@@ -10,10 +10,15 @@
 
 pub mod config;
 pub mod edge_search;
+pub mod episode_search;
 pub mod filters;
+pub mod node_search;
 pub mod recipes;
 pub mod rerank;
+pub mod results;
 pub mod rrf;
+#[allow(clippy::module_inception)]
+pub mod search;
 
 // ── config re-exports ────────────────────────────────────────────────────────
 pub use config::{
@@ -48,6 +53,10 @@ pub use recipes::{
 };
 
 // ── search function re-exports ────────────────────────────────────────────────
-pub use edge_search::edge_search;
+pub use edge_search::{edge_search, edge_search_simple};
+pub use episode_search::episode_search;
+pub use node_search::node_search;
 pub use rerank::{episode_mentions_rerank, maximal_marginal_relevance, node_distance_rerank};
+pub use results::SearchResults;
 pub use rrf::rrf;
+pub use search::search;

@@ -13,7 +13,7 @@ use crate::helpers::SEMAPHORE_LIMIT;
 use crate::llm::LlmClient;
 use crate::pipeline::add_episode::add_episode;
 use crate::pipeline::clients::Clients;
-use crate::search::{SearchConfig, edge_search};
+use crate::search::{SearchConfig, edge_search_simple};
 use crate::types::{EntityEdge, EntityNode, EpisodeType, EpisodicEdge, EpisodicNode};
 
 /// Request to ingest a single episode. All fields are explicit — there is no
@@ -101,9 +101,13 @@ impl Chronicle {
         group_ids: &[String],
         config: &SearchConfig,
     ) -> Result<Vec<EntityEdge>, ChronicleError> {
-        edge_search(
+        edge_search_simple(
             self.clients.driver.as_ref(),
             self.clients.embedder.as_ref(),
+            // Facade `search()` has no cross_encoder wired yet; it arrives with
+            // `with_cross_encoder` + `search_()` in Task 7. Cross-encoder recipes
+            // therefore surface InvalidInput here until then.
+            None,
             query,
             group_ids,
             config,

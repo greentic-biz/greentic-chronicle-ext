@@ -12,6 +12,7 @@ pub mod config;
 pub mod edge_search;
 pub mod filters;
 pub mod recipes;
+pub mod rerank;
 pub mod rrf;
 
 // ── config re-exports ────────────────────────────────────────────────────────
@@ -48,4 +49,5 @@ pub use recipes::{
 
 // ── search function re-exports ────────────────────────────────────────────────
 pub use edge_search::edge_search;
+pub use rerank::{episode_mentions_rerank, maximal_marginal_relevance, node_distance_rerank};
 pub use rrf::rrf;

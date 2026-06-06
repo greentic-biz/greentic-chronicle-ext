@@ -122,6 +122,15 @@ Upstream `retrieve_episodes` returns episodes in `created_at DESC` order; ties w
 
 Upstream `_build_episode_context` in `graphiti.py` formats `episode.valid_at` which is nullable (`Optional[datetime]`); when `None`, it formats as `"None"`. `EpisodicNode.valid_at` in this crate is non-optional (`DateTime<Utc>`), so the timestamp is always a formatted string. Episodes from older upstream graphs with `null` valid_at cannot be ingested via this crate without a pre-migration step.
 
+### D-15: episode_mentions reranker — ASC sort + inf-retain quirk (bug-for-bug)
+
+`episode_mentions_rerank` (`crates/chronicle-core/src/search/rerank.rs`) ports `episode_mentions_reranker` (`graphiti_core/search/search_utils.py` @ 34f56e65) exactly, including two counterintuitive upstream behaviours ("episode_mentions ASC quirk"):
+
+1. **Ascending sort by mention count** — `sorted_uuids.sort(key=lambda u: scores[u])` orders nodes with *fewer* MENTIONS first. This is the opposite of the intuitive "most-mentioned is most relevant" ordering, but is exactly what upstream does, so it is reproduced.
+2. **Unmentioned nodes retained at the end** — nodes with no MENTIONS get `float('inf')`, and the literal filter `scores[uuid] >= min_score` keeps them (`inf >= min_score` is always true). The returned scores are the raw counts / `inf`, not inverted. Reproduced literally.
+
+Both `node_distance_rerank` and `maximal_marginal_relevance` in the same module are faithful ports with no behavioural deviation (the only adaptation is `f32` embeddings widened to `f64` before arithmetic, matching upstream numpy float64). `normalize_l2`'s zero-vector guard (`np.where(norm == 0, arr, arr / norm)` → zero vector returned unchanged) is reproduced.
+
 ---
 
 ## DEFERRED
@@ -133,7 +142,8 @@ Features acknowledged but out of Phase-1 scope. Listed with target phase.
 | Reflexion (self-critique loop) | absent in upstream v0.29.1 | Not present in pinned upstream; not applicable |
 | Communities / saga / bulk ingest | Phase 4 | `build_communities`, `build_community_for_node`, community edge/node types |
 | BFS traversal in edge search | Phase 2 | `EdgeSearchMethod::BreadthFirstSearch` stub present; implementation deferred |
-| MMR / CrossEncoder / NodeDistance / EpisodeMentions rerankers | Phase 2 | Enum variants present; wiring deferred |
+| MMR / NodeDistance / EpisodeMentions rerankers | Phase 2 | Algorithms ported in `search/rerank.rs` (see D-15); scope-dispatch wiring deferred to top-level search |
+| CrossEncoder reranker | Phase 2 | Enum variant present; client + wiring deferred |
 | `SearchFilters` wiring in edge_search | Phase 2 | Needed for edge candidate re-ranking (D-3) |
 | Multi-episode extraction path | Phase 2 | `_process_episode_data` bulk path; `_collapse_exact_duplicate_extracted_nodes`; `node_episode_index_map` |
 | Entity/edge-type registries + attribute extraction | Phase 2 | `entity_types` and `edge_types` Pydantic registry; `extract_attributes_from_nodes` batch path |

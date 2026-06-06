@@ -1,0 +1,24 @@
+[package]
+name = "chronicle-driver-surreal"
+description = "Embedded SurrealDB GraphDriver backend for chronicle (kv-rocksdb / kv-mem)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+chronicle-core.workspace = true
+surrealdb.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+chronicle-testkit.workspace = true
+tempfile.workspace = true
+uuid.workspace = true

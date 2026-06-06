@@ -195,7 +195,7 @@ checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
 name = "chronicle-core"
-version = "0.1.0"
+version = "1.2.0-research"
 dependencies = [
  "async-trait",
  "blake2",
@@ -212,7 +212,7 @@ dependencies = [
 
 [[package]]
 name = "chronicle-driver-neo4j"
-version = "0.1.0"
+version = "1.2.0-research"
 dependencies = [
  "async-trait",
  "chronicle-core",
@@ -227,7 +227,7 @@ dependencies = [
 
 [[package]]
 name = "chronicle-llm-openai"
-version = "0.1.0"
+version = "1.2.0-research"
 dependencies = [
  "anyhow",
  "async-openai",
@@ -245,7 +245,7 @@ dependencies = [
 
 [[package]]
 name = "chronicle-testkit"
-version = "0.1.0"
+version = "1.2.0-research"
 dependencies = [
  "async-trait",
  "chronicle-core",

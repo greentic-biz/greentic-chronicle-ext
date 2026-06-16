@@ -339,6 +339,27 @@ impl Chronicle {
         .await
     }
 
+    /// Ingest pre-chunked documents into the knowledge store (no LLM extraction).
+    /// See [`crate::document_rag`].
+    pub async fn ingest_document_chunks(
+        &self,
+        chunks: Vec<crate::document_rag::DocumentChunk>,
+        group_id: &str,
+    ) -> Result<Vec<String>, ChronicleError> {
+        crate::document_rag::ingest_chunks(&self.clients, chunks, group_id).await
+    }
+
+    /// Hybrid (BM25 + cosine) retrieval of stored document chunks, scoped to
+    /// knowledge group_id(s). See [`crate::document_rag`].
+    pub async fn search_document_chunks(
+        &self,
+        query: &str,
+        group_ids: &[String],
+        limit: usize,
+    ) -> Result<Vec<crate::document_rag::DocumentChunkHit>, ChronicleError> {
+        crate::document_rag::search_chunks(&self.clients, query, group_ids, limit).await
+    }
+
     /// Build the backend's indices / constraints, optionally dropping existing
     /// data first.
     pub async fn build_indices_and_constraints(

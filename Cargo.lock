@@ -678,7 +678,7 @@ checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
 name = "chronicle-core"
-version = "1.2.0-research"
+version = "1.3.0-research.0"
 dependencies = [
  "async-trait",
  "blake2",
@@ -695,7 +695,7 @@ dependencies = [
 
 [[package]]
 name = "chronicle-driver-falkor"
-version = "1.2.0-research"
+version = "1.3.0-research.0"
 dependencies = [
  "async-trait",
  "chronicle-core",
@@ -712,7 +712,7 @@ dependencies = [
 
 [[package]]
 name = "chronicle-driver-neo4j"
-version = "1.2.0-research"
+version = "1.3.0-research.0"
 dependencies = [
  "async-trait",
  "chronicle-core",
@@ -727,7 +727,7 @@ dependencies = [
 
 [[package]]
 name = "chronicle-driver-surreal"
-version = "1.2.0-research"
+version = "1.3.0-research.0"
 dependencies = [
  "async-trait",
  "chronicle-core",
@@ -745,7 +745,7 @@ dependencies = [
 
 [[package]]
 name = "chronicle-llm-openai"
-version = "1.2.0-research"
+version = "1.3.0-research.0"
 dependencies = [
  "anyhow",
  "async-openai",
@@ -763,7 +763,7 @@ dependencies = [
 
 [[package]]
 name = "chronicle-testkit"
-version = "1.2.0-research"
+version = "1.3.0-research.0"
 dependencies = [
  "async-trait",
  "chronicle-core",

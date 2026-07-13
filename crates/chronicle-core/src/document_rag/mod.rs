@@ -26,6 +26,12 @@ pub struct DocumentChunk {
     pub text: String,
     #[serde(default)]
     pub metadata: Map<String, Value>,
+    /// Optional caller-supplied embedding vector. When `Some`, ingest stores it
+    /// directly instead of re-embedding the text (its dimension must match the
+    /// embedder). When `None`, ingest embeds `text`. `#[serde(default)]` keeps
+    /// older corpora (which lack this field) deserializable to `None`.
+    #[serde(default)]
+    pub embedding: Option<Vec<f32>>,
 }
 
 /// A retrieval hit: chunk text + relevance score + provenance.
@@ -150,6 +156,11 @@ pub fn node_to_chunk_hit(node: EntityNode, score: f64) -> DocumentChunkHit {
 
 /// Ingest pre-chunked text: batch-embed, build nodes, persist. Returns chunk UUIDs.
 /// Idempotent: deterministic UUIDs + driver UPSERT. No LLM extraction.
+///
+/// Chunks that carry a precomputed [`DocumentChunk::embedding`] are stored with
+/// that vector as-is (skipping re-embedding); only chunks without one are sent
+/// to the embedder. A precomputed vector whose dimension does not match the
+/// embedder is rejected rather than silently stored.
 pub async fn ingest_chunks(
     clients: &Clients,
     chunks: Vec<DocumentChunk>,
@@ -158,19 +169,60 @@ pub async fn ingest_chunks(
     if chunks.is_empty() {
         return Ok(Vec::new());
     }
-    let texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
-    let embeddings = clients.embedder.create_batch(&texts).await?;
-    if embeddings.len() != chunks.len() {
-        return Err(ChronicleError::InvalidInput(format!(
-            "embedder returned {} vectors for {} chunks",
-            embeddings.len(),
-            chunks.len()
-        )));
+    let expected_dim = clients.embedder.embedding_dim();
+
+    // Validate any caller-supplied vectors up front and collect the texts that
+    // still need embedding, preserving original chunk order.
+    let mut texts_to_embed: Vec<String> = Vec::new();
+    for chunk in &chunks {
+        match &chunk.embedding {
+            Some(vector) => {
+                if vector.len() != expected_dim {
+                    return Err(ChronicleError::InvalidInput(format!(
+                        "precomputed embedding for doc_id={} chunk_index={} has dimension {} but embedder expects {}",
+                        chunk.doc_id,
+                        chunk.chunk_index,
+                        vector.len(),
+                        expected_dim
+                    )));
+                }
+            }
+            None => texts_to_embed.push(chunk.text.clone()),
+        }
     }
+
+    // Embed only the chunks that lack a precomputed vector; skip the call
+    // entirely when every chunk already carries one.
+    let fresh_embeddings = if texts_to_embed.is_empty() {
+        Vec::new()
+    } else {
+        let embeddings = clients.embedder.create_batch(&texts_to_embed).await?;
+        if embeddings.len() != texts_to_embed.len() {
+            return Err(ChronicleError::InvalidInput(format!(
+                "embedder returned {} vectors for {} chunks",
+                embeddings.len(),
+                texts_to_embed.len()
+            )));
+        }
+        embeddings
+    };
+
+    // Re-interleave freshly computed vectors with the precomputed ones in
+    // original chunk order. `fresh_embeddings` is in the same order the `None`
+    // chunks were encountered above, so a single forward iterator realigns them.
     let created_at = Utc::now();
+    let mut fresh = fresh_embeddings.into_iter();
     let mut nodes = Vec::with_capacity(chunks.len());
     let mut uuids = Vec::with_capacity(chunks.len());
-    for (chunk, embedding) in chunks.into_iter().zip(embeddings) {
+    for chunk in chunks {
+        let embedding = match &chunk.embedding {
+            Some(vector) => vector.clone(),
+            None => fresh.next().ok_or_else(|| {
+                ChronicleError::InvalidInput(
+                    "internal error: fewer embeddings than chunks awaiting one".to_string(),
+                )
+            })?,
+        };
         let node = chunk_to_entity_node(&chunk, group_id, embedding, created_at);
         uuids.push(node.uuid.clone());
         nodes.push(node);
@@ -259,6 +311,7 @@ mod tests {
             chunk_index: 2,
             text: "hello world".into(),
             metadata: md,
+            embedding: None,
         }
     }
 

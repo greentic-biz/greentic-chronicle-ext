@@ -1,0 +1,8 @@
+greentic-chronicle-ext
+
+This product includes software ported from Graphiti
+(https://github.com/getzep/graphiti), Copyright Zep Software, Inc.,
+licensed under the Apache License, Version 2.0.
+
+Port baseline: graphiti v0.29.1
+(commit 34f56e65e0fe2096132c8d16f3a1a4ac9300a5f6).

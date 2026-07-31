@@ -1,0 +1,21 @@
+[package]
+name = "chronicle-driver-neo4j"
+description = "Neo4j GraphDriver backend for chronicle (neo4rs/Bolt)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+chronicle-core.workspace = true
+neo4rs.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+chronicle-testkit.workspace = true
+uuid.workspace = true

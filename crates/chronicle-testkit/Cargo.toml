@@ -1,0 +1,25 @@
+[package]
+name = "chronicle-testkit"
+description = "Deterministic test doubles for chronicle-core (in-memory driver, scripted LLM)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+chronicle-core.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+tiktoken-rs.workspace = true
+
+[dev-dependencies]
+# Live ground-truth mode (gated, #[ignore]'d): wraps the real OpenAI clients.
+chronicle-llm-openai.workspace = true
+chronicle-driver-neo4j.workspace = true
+
+[[example]]
+name = "cost_report"
+path = "examples/cost_report.rs"

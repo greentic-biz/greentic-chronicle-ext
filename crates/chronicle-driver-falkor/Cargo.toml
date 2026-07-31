@@ -1,0 +1,23 @@
+[package]
+name = "chronicle-driver-falkor"
+description = "FalkorDB GraphDriver backend for chronicle (Redis-module openCypher)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+chronicle-core.workspace = true
+falkordb.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+chronicle-testkit.workspace = true
+uuid.workspace = true

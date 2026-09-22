@@ -8,6 +8,10 @@ members = [
     "crates/chronicle-driver-surreal",
     "crates/chronicle-driver-falkor",
     "crates/chronicle-llm-openai",
+    # DW provider adapters moved from greenticai/greentic-dw-providers
+    # (publish = false; they bind chronicle to the published greentic-dw-* traits).
+    "crates/greentic-dw-memory-chronicle",
+    "crates/greentic-dw-knowledge-chronicle",
 ]
 
 [workspace.package]
@@ -50,3 +54,9 @@ async-openai = { version = "0.40", default-features = false, features = [
     "embedding",
 ] }
 anyhow = "1"
+# Greentic DW provider contracts, from the crates.io 1.2.0-dev lane.
+greentic-dw-memory-long-term = { version = ">=1.2.0-dev, <1.3.0-0" }
+greentic-dw-knowledge = { version = ">=1.2.0-dev, <1.3.0-0" }
+greentic-dw-llm = { version = ">=1.2.0-dev, <1.3.0-0" }
+greentic-dw-embedding = { version = ">=1.2.0-dev, <1.3.0-0" }
+greentic-types = { version = ">=1.2.0-dev, <1.3.0-0", default-features = false, features = ["std", "serde", "time"] }

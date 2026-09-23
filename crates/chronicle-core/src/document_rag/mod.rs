@@ -8,6 +8,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use crate::driver::GraphDriver;
 use crate::errors::ChronicleError;
 use crate::pipeline::clients::Clients;
 use crate::search::config::NodeSearchConfig;
@@ -231,6 +232,96 @@ pub async fn ingest_chunks(
     Ok(uuids)
 }
 
+/// Build entity nodes for chunks that ALL carry a precomputed vector of
+/// exactly `dims` floats. Validation covers every chunk before any node is
+/// returned, so a caller that persists the result never writes half a batch.
+pub fn precomputed_chunks_to_nodes(
+    chunks: &[DocumentChunk],
+    group_id: &str,
+    dims: usize,
+    created_at: DateTime<Utc>,
+) -> Result<Vec<EntityNode>, ChronicleError> {
+    chunks
+        .iter()
+        .map(|chunk| {
+            let vector = chunk.embedding.as_ref().ok_or_else(|| {
+                ChronicleError::InvalidInput(format!(
+                    "doc_id={} chunk_index={} carries no precomputed embedding",
+                    chunk.doc_id, chunk.chunk_index
+                ))
+            })?;
+            if vector.len() != dims {
+                return Err(ChronicleError::InvalidInput(format!(
+                    "doc_id={} chunk_index={} has dimension {} but the index expects {}",
+                    chunk.doc_id,
+                    chunk.chunk_index,
+                    vector.len(),
+                    dims
+                )));
+            }
+            Ok(chunk_to_entity_node(
+                chunk,
+                group_id,
+                vector.clone(),
+                created_at,
+            ))
+        })
+        .collect()
+}
+
+/// Persist pre-chunked, pre-embedded text straight through a driver — no
+/// embedder, no LLM, no [`Clients`]. Used by callers that received vectors
+/// from elsewhere (the index server). Idempotent for the same
+/// `(group_id, doc_id, chunk_index)` because chunk UUIDs are deterministic.
+pub async fn ingest_chunks_with_vectors(
+    driver: &dyn GraphDriver,
+    chunks: &[DocumentChunk],
+    group_id: &str,
+    dims: usize,
+) -> Result<Vec<String>, ChronicleError> {
+    if chunks.is_empty() {
+        return Ok(Vec::new());
+    }
+    let nodes = precomputed_chunks_to_nodes(chunks, group_id, dims, Utc::now())?;
+    driver.save_entity_nodes(&nodes).await?;
+    Ok(nodes.into_iter().map(|node| node.uuid).collect())
+}
+
+/// Hybrid BM25 (on `query`) + cosine (on `query_vector`) retrieval with RRF,
+/// scoped to `group_ids`, for callers that embedded the query themselves.
+pub async fn search_chunks_by_vector(
+    driver: &dyn GraphDriver,
+    query: &str,
+    query_vector: &[f32],
+    group_ids: &[String],
+    limit: usize,
+) -> Result<Vec<DocumentChunkHit>, ChronicleError> {
+    if query.trim().is_empty() || query_vector.is_empty() || limit == 0 {
+        return Ok(Vec::new());
+    }
+    let config = NodeSearchConfig::default(); // BM25 + Cosine, RRF
+    let (nodes, scores) = node_search(
+        driver,
+        None,
+        query,
+        query_vector,
+        group_ids,
+        Some(&config),
+        &SearchFilters::default(),
+        None,
+        None,
+        limit,
+        0.0,
+    )
+    .await?;
+    Ok(nodes
+        .into_iter()
+        .zip(scores)
+        .filter(|(node, _)| node.labels.iter().any(|l| l == DOCUMENT_CHUNK_LABEL))
+        .map(|(node, score)| node_to_chunk_hit(node, score))
+        .collect())
+}
+
 /// Retrieve top-k document chunks for a query via hybrid BM25+cosine (RRF),
 /// scoped to the given knowledge group_id(s). Returns mapped hits, newest-API
 /// node ordering preserved.
@@ -244,28 +335,14 @@ pub async fn search_chunks(
         return Ok(Vec::new());
     }
     let query_vector = clients.embedder.create(&query.replace('\n', " ")).await?;
-    let config = NodeSearchConfig::default(); // BM25 + Cosine, RRF
-    let (nodes, scores) = node_search(
+    search_chunks_by_vector(
         clients.driver.as_ref(),
-        None, // no cross-encoder in the lite path
         query,
         &query_vector,
         group_ids,
-        Some(&config),
-        &SearchFilters::default(),
-        None,
-        None,
         limit,
-        0.0,
     )
-    .await?;
-    let hits = nodes
-        .into_iter()
-        .zip(scores)
-        .filter(|(node, _)| node.labels.iter().any(|l| l == DOCUMENT_CHUNK_LABEL))
-        .map(|(node, score)| node_to_chunk_hit(node, score))
-        .collect();
-    Ok(hits)
+    .await
 }
 
 #[cfg(test)]

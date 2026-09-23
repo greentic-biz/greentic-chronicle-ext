@@ -1,0 +1,151 @@
+# Build chronicle-index-server and roll it out to the demo lane
+# (ECS service `greentic-chronicle-index-demo`, cluster `default`,
+# ap-southeast-1), served at https://chronicle-index.demo.greentic.cloud
+# behind the designer's shared ALB.
+#
+# The AWS side (ECR repo, EFS access point, target group, listener rule,
+# task role, service) is provisioned once by hand; this workflow only pushes
+# an image and moves the service onto it. Until the service exists it pushes
+# the image and stops, so the first image can be produced here.
+#
+# The OIDC role `gh-actions-greentic-chronicle-index-deploy` trusts ONLY this
+# repository's `develop` branch, and can touch only this service's ECR repo,
+# task definitions and service.
+name: deploy-index-demo
+
+on:
+  push:
+    branches: [develop]
+    paths:
+      - "crates/chronicle-index-server/**"
+      - "crates/chronicle-core/**"
+      - "crates/chronicle-driver-surreal/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".dockerignore"
+      - ".github/workflows/deploy-index-demo.yml"
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+# The store is single-writer (RocksDB lock), and the service deploys 0/100;
+# two overlapping rollouts would only fight each other. Queue, never cancel:
+# a cancelled run can leave the service mid-rollout.
+concurrency:
+  group: deploy-index-demo
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ap-southeast-1
+  AWS_ACCOUNT: "599558443099"
+  ECR_REPO: greentic-chronicle-index-server
+  ECS_CLUSTER: default
+  ECS_SERVICE: greentic-chronicle-index-demo
+  CONTAINER_NAME: chronicle-index-server
+  PUBLIC_HOST: chronicle-index.demo.greentic.cloud
+  ALB_DNS: greentic-designer-efs-alb-1490651752.ap-southeast-1.elb.amazonaws.com
+
+jobs:
+  deploy:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image and push to ECR
+        run: |
+          set -euo pipefail
+          REG="${AWS_ACCOUNT}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          aws ecr get-login-password --region "$AWS_REGION" \
+            | docker login --username AWS --password-stdin "$REG"
+
+          IMG="${REG}/${ECR_REPO}:pgdemo-${GITHUB_SHA::7}"
+          echo "Image: $IMG"
+          echo "IMG=$IMG" >> "$GITHUB_ENV"
+
+          docker buildx build --platform linux/amd64 \
+            -f crates/chronicle-index-server/Dockerfile \
+            -t "$IMG" \
+            --cache-from type=registry,ref="${REG}/${ECR_REPO}:buildcache" \
+            --cache-to type=registry,ref="${REG}/${ECR_REPO}:buildcache",mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true \
+            --push .
+
+      # A cold release build of RocksDB + SurrealDB can outlive the ~1h OIDC
+      # session. Re-assume before touching ECS.
+      - name: Refresh AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Roll the service onto the new image
+        run: |
+          set -euo pipefail
+          status=$(aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
+            --query 'services[0].status' --output text 2>/dev/null || true)
+          if [ "$status" != "ACTIVE" ]; then
+            echo "service not created yet (status: ${status:-none}); image pushed as $IMG, nothing to roll out."
+            echo "SKIP_VERIFY=1" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          current=$(aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
+            --query 'services[0].taskDefinition' --output text)
+          echo "Current task definition: $current"
+
+          aws ecs describe-task-definition --task-definition "$current" --query taskDefinition \
+            | jq --arg img "$IMG" --arg name "$CONTAINER_NAME" '
+                .containerDefinitions |= map(if .name == $name then .image = $img else . end)
+                | del(.taskDefinitionArn, .revision, .status, .requiresAttributes,
+                      .compatibilities, .registeredAt, .registeredBy, .deregisteredAt)' \
+            > taskdef.json
+
+          if ! jq -e --arg img "$IMG" --arg name "$CONTAINER_NAME" \
+              '.containerDefinitions[] | select(.name == $name) | .image == $img' taskdef.json >/dev/null; then
+            echo "::error::container ${CONTAINER_NAME} not found in ${current}; refusing to register a task definition that does not run the new image"
+            exit 1
+          fi
+
+          next=$(aws ecs register-task-definition --cli-input-json file://taskdef.json \
+            --query 'taskDefinition.taskDefinitionArn' --output text)
+          echo "New task definition: $next"
+
+          aws ecs update-service --cluster "$ECS_CLUSTER" --service "$ECS_SERVICE" \
+            --task-definition "$next" --query 'service.deployments[0].id' --output text
+          aws ecs wait services-stable --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE"
+
+          running=$(aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
+            --query 'services[0].taskDefinition' --output text)
+          if [ "$running" != "$next" ]; then
+            echo "::error::service settled on ${running}, not ${next} (a failed rollout rolls back)"
+            exit 1
+          fi
+
+      # Through the ALB by Host header, so this works whether or not public
+      # DNS for the hostname exists yet.
+      - name: Verify /healthz
+        if: env.SKIP_VERIFY != '1'
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 20); do
+            body=$(curl -sk --max-time 10 -H "Host: ${PUBLIC_HOST}" "https://${ALB_DNS}/healthz" || true)
+            if [ "$body" = "ok" ]; then
+              echo "healthz: ok"
+              exit 0
+            fi
+            echo "attempt $i: got '${body}'"
+            sleep 15
+          done
+          echo "::error::/healthz never answered ok"
+          exit 1

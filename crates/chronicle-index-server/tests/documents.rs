@@ -1,6 +1,7 @@
 mod common;
 
 use axum::http::StatusCode;
+use chronicle_core::driver::EntityNodeOps as _;
 use common::*;
 use serde_json::{Value, json};
 
@@ -159,6 +160,100 @@ async fn an_unsafe_document_id_is_refused_on_upsert_and_delete() {
     // control character in the URI.
     let (status, body) = call(&app, "DELETE", "/v1/indexes/kb1/documents/a%1Fb", &h, None).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+}
+
+#[tokio::test]
+async fn an_unsafe_document_id_against_a_missing_index_is_400_not_404() {
+    // The id check must run before the index lookup, so a caller never
+    // learns whether an index exists from the status code of a malformed
+    // request.
+    let app = app().await;
+    let key = mint(&app, "acme", &["*"]).await;
+    let h = tenant_headers(&key, "acme", None);
+    let (status, body) = upsert(&app, &h, vec![document("a\u{1f}b", "h1", &[(0, "x", 0)])]).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["code"], "bad_request");
+}
+
+#[tokio::test]
+async fn an_interrupted_write_leaves_no_permanently_orphaned_chunks() {
+    // Simulates a crash mid-upsert: an "intent" record naming a hypothetical
+    // v2's chunks has already been written under the OLD hash, and the v2
+    // chunks that would go stale under v3 were already ingested into the
+    // graph — but the process died before the FINAL record (new hash, new
+    // indexes) was ever written. A later upsert (v3) must still clean up
+    // every chunk the intent record named, even ones it never itself wrote.
+    let state = chronicle_index_server::state::AppState::in_memory(BOOTSTRAP)
+        .await
+        .expect("state");
+    let app = chronicle_index_server::router(state.clone(), 16 * 1024 * 1024);
+    let key = mint(&app, "acme", &["*"]).await;
+    let h = tenant_headers(&key, "acme", None);
+    create_index(&app, &h, "kb1").await;
+
+    // v1: one chunk, hash h1, written normally through HTTP.
+    upsert(&app, &h, vec![document("d1", "h1", &[(0, "keep", 1)])]).await;
+
+    let group_id = "idx:acme:general:kb1";
+
+    // Hand-write the intent record a real (crashed) v2 upsert would have
+    // left: still the OLD hash, but chunk_indexes covering v1's chunk 0 AND
+    // v2's hypothetical chunks 1 and 2.
+    state
+        .meta
+        .put_doc(&chronicle_index_server::meta::DocRecord {
+            group_id: group_id.to_string(),
+            document_id: "d1".to_string(),
+            content_hash: "h1".to_string(),
+            chunk_indexes: vec![0, 1, 2],
+        })
+        .await
+        .expect("put intent record");
+
+    // And hand-ingest the chunks that v2 would have written before the
+    // crash, so they are genuinely present in the graph as orphans.
+    let driver = state.graphs.for_dims(DIMS).await.expect("driver");
+    let mut v1 = vec![0.0_f32; DIMS];
+    v1[1] = 1.0;
+    let mut v2 = vec![0.0_f32; DIMS];
+    v2[2] = 1.0;
+    let orphans = vec![
+        chronicle_core::DocumentChunk {
+            doc_id: "d1".to_string(),
+            chunk_index: 1,
+            text: "stale one".to_string(),
+            metadata: serde_json::Map::new(),
+            embedding: Some(v1),
+        },
+        chronicle_core::DocumentChunk {
+            doc_id: "d1".to_string(),
+            chunk_index: 2,
+            text: "stale two".to_string(),
+            metadata: serde_json::Map::new(),
+            embedding: Some(v2),
+        },
+    ];
+    chronicle_core::ingest_chunks_with_vectors(driver.as_ref(), &orphans, group_id, DIMS)
+        .await
+        .expect("ingest orphans");
+
+    // v3 arrives: one chunk, a fresh hash. It must see the intent record's
+    // hash ("h1") as stale, redo the document, and clean up chunks 1 and 2
+    // even though this call never itself wrote them.
+    let (status, body) = upsert(&app, &h, vec![document("d1", "h3", &[(0, "keep", 1)])]).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    assert_eq!(stats(&app, &h).await["chunk_count"], 1);
+
+    let nodes = driver
+        .get_entity_nodes_by_group_ids(&[group_id.to_string()])
+        .await
+        .expect("nodes");
+    assert_eq!(
+        nodes.len(),
+        1,
+        "chunks orphaned by the interrupted write must be gone: {nodes:?}"
+    );
 }
 
 #[tokio::test]

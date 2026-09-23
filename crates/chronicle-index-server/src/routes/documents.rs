@@ -29,12 +29,11 @@ struct PreparedDocument {
     chunks: Vec<DocumentChunk>,
 }
 
-/// Validates one document completely — ids, indexes, every vector — so the
-/// handler can refuse a batch before writing any of it.
+/// Validates one document's chunks — indexes, every vector — so the handler
+/// can refuse a batch before writing any of it. Document-id validity is
+/// checked earlier, in [`upsert`] itself, before the index is even looked
+/// up: an unsafe id must answer 400 whether or not the index exists.
 fn prepare(doc: DocumentUpsert, dims: usize) -> Result<PreparedDocument, ApiError> {
-    if !valid_document_id(&doc.document_id) {
-        return Err(ApiError::bad_request("document_id is required"));
-    }
     let mut seen = HashSet::new();
     let mut chunk_indexes = Vec::with_capacity(doc.chunks.len());
     let mut chunks = Vec::with_capacity(doc.chunks.len());
@@ -73,6 +72,14 @@ pub async fn upsert(
     Path(index_id): Path<String>,
     ApiJson(body): ApiJson<UpsertRequest>,
 ) -> Result<Json<UpsertResponse>, ApiError> {
+    // Checked first thing, before the index is even looked up: an unsafe id
+    // must answer 400 regardless of whether the index exists, never a 404
+    // that leaks index existence past a bad request.
+    for doc in &body.documents {
+        if !valid_document_id(&doc.document_id) {
+            return Err(ApiError::bad_request("document_id is invalid"));
+        }
+    }
     let group_id = scope.group_id(&index_id)?;
     let _guard = state.locks.lock(&group_id).await;
     let mut index = state
@@ -98,26 +105,57 @@ pub async fn upsert(
             unchanged += 1;
             continue;
         }
-        // Order matters for crash safety: write the new chunks, drop the ones
-        // the new version no longer has, and only then record the new hash.
-        // A crash before the record leaves the OLD hash, so the next sync
-        // redoes this document instead of skipping it.
+
+        // Crash safety for a changed document: nothing here may ever leave a
+        // chunk that no later step knows to clean up. So the FIRST write is
+        // an "intent" record — chunk_indexes = the union of the previous
+        // record's indexes and the incoming ones (sorted, deduped), under
+        // the OLD hash (or "" when there was no previous record). It names
+        // every chunk that might come to exist for this document before a
+        // single new chunk is ingested or a single stale one is dropped. A
+        // crash at any point between here and the FINAL put_doc below
+        // leaves a record whose hash disagrees with the incoming hash (so
+        // the next sync redoes this document instead of skipping it) and
+        // whose chunk_indexes cover every chunk that might exist (so a
+        // retry, delete_document, and delete_index all reach them). Only
+        // once the new chunks are ingested and every stale one is gone do
+        // we write the FINAL record — the new hash, and only the new
+        // indexes.
+        let previous_hash = previous
+            .as_ref()
+            .map(|p| p.content_hash.clone())
+            .unwrap_or_default();
+        let mut union = previous
+            .as_ref()
+            .map(|p| p.chunk_indexes.clone())
+            .unwrap_or_default();
+        union.extend(doc.chunk_indexes.iter().copied());
+        union.sort_unstable();
+        union.dedup();
+        state
+            .meta
+            .put_doc(&DocRecord {
+                group_id: group_id.clone(),
+                document_id: doc.document_id.clone(),
+                content_hash: previous_hash,
+                chunk_indexes: union.clone(),
+            })
+            .await?;
+
         ingest_chunks_with_vectors(driver.as_ref(), &doc.chunks, &group_id, dims).await?;
-        if let Some(previous) = previous {
-            let dropped: Vec<i64> = previous
-                .chunk_indexes
-                .iter()
-                .copied()
-                .filter(|i| !doc.chunk_indexes.contains(i))
-                .collect();
-            let stale = chunk_uuids(&group_id, &doc.document_id, &dropped);
-            if !stale.is_empty() {
-                driver
-                    .delete_entity_nodes_by_uuids(&stale)
-                    .await
-                    .map_err(ApiError::internal)?;
-            }
+
+        let stale: Vec<i64> = union
+            .into_iter()
+            .filter(|i| !doc.chunk_indexes.contains(i))
+            .collect();
+        let stale_uuids = chunk_uuids(&group_id, &doc.document_id, &stale);
+        if !stale_uuids.is_empty() {
+            driver
+                .delete_entity_nodes_by_uuids(&stale_uuids)
+                .await
+                .map_err(ApiError::internal)?;
         }
+
         state
             .meta
             .put_doc(&DocRecord {
@@ -129,8 +167,10 @@ pub async fn upsert(
             .await?;
         upserted += 1;
     }
-    index.updated_at_ms = now_ms();
-    state.meta.put_index(&index).await?;
+    if upserted > 0 {
+        index.updated_at_ms = now_ms();
+        state.meta.put_index(&index).await?;
+    }
     Ok(Json(UpsertResponse {
         upserted,
         unchanged,

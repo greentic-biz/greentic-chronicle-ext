@@ -12,6 +12,9 @@ members = [
     # (publish = false; they bind chronicle to the published greentic-dw-* traits).
     "crates/greentic-dw-memory-chronicle",
     "crates/greentic-dw-knowledge-chronicle",
+    # The runner-side edge: the two providers above as greentic-runner
+    # agent-runtime extensions, plus the greentic-runner-full binary.
+    "crates/greentic-runner-chronicle",
 ]
 
 [workspace.package]
@@ -55,6 +58,8 @@ async-openai = { version = "0.40", default-features = false, features = [
 ] }
 anyhow = "1"
 # Greentic DW provider contracts, from the crates.io 1.2.0-dev lane.
+greentic-dw-memory-chronicle = { path = "crates/greentic-dw-memory-chronicle" }
+greentic-dw-knowledge-chronicle = { path = "crates/greentic-dw-knowledge-chronicle" }
 greentic-dw-memory-long-term = { version = ">=1.2.0-dev, <1.3.0-0" }
 greentic-dw-knowledge = { version = ">=1.2.0-dev, <1.3.0-0" }
 greentic-dw-llm = { version = ">=1.2.0-dev, <1.3.0-0" }

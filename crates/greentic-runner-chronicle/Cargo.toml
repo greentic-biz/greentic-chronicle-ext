@@ -1,0 +1,60 @@
+[package]
+name = "greentic-runner-chronicle"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+# MIT, like the greentic-runner code it was moved from (greentic-runner#787).
+license = "MIT"
+# Never published, and cannot be: it depends on the private chronicle crates.
+# That is the whole point — greentic-runner-host stays publishable because this
+# crate exists.
+publish = false
+repository.workspace = true
+readme = "README.md"
+description = "Chronicle long-term memory and knowledge backends as greentic-runner agent-runtime extensions, plus the greentic-runner-full binary that registers them."
+
+[dependencies]
+# The seam. `runtime_ext::AgentRuntimeExtension` and `cli_main` landed in
+# greentic-runner#787, and the first lane build carrying it is
+# 1.2.0-dev.35804394619 — so these are plain crates.io requirements rather than
+# the git pins this branch opened with. All three are published from ONE
+# workspace per run, so the lane range resolves them to one build and the
+# runner's own internal deps unify instead of resolving a second copy.
+greentic-runner-host = { version = ">=1.2.0-dev, <1.3.0-0" }
+greentic-aw-runtime = { version = ">=1.2.0-dev, <1.3.0-0" }
+# Only the binary needs this one: `cli_main()` is greentic-runner's whole `main`.
+greentic-runner = { version = ">=1.2.0-dev, <1.3.0-0" }
+
+greentic-dw-memory-chronicle = { workspace = true }
+greentic-dw-knowledge-chronicle = { workspace = true, features = ["surreal", "neo4j"] }
+greentic-dw-knowledge = { workspace = true }
+greentic-dw-llm = { workspace = true }
+greentic-dw-llm-openai-compatible = { version = ">=1.2.0-dev, <1.3.0-0" }
+greentic-dw-embedding = { workspace = true }
+greentic-dw-embedding-openai-compatible = { version = ">=1.2.0-dev, <1.3.0-0" }
+# `telemetry-autoinit` + `otel-keys` are what the greentic-runner binary's own
+# `telemetry::main` attribute needs.
+greentic-types = { workspace = true, features = ["otel-keys", "telemetry-autoinit"] }
+
+# The drivers are built HERE rather than by the knowledge provider, because this
+# is the edge that owns bindgen / RocksDB — the same reason greentic-runner-host
+# built them while the feature lived there.
+chronicle-core = { workspace = true }
+chronicle-driver-surreal = { workspace = true }
+chronicle-driver-neo4j = { workspace = true }
+chronicle-driver-falkor = { workspace = true }
+
+async-trait = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+serial_test = "3"
+# `knowledge_mount`'s moved corpus test builds a throwaway directory. It was a
+# dev-dependency of greentic-runner-host, which is where this test lived.
+tempfile = { workspace = true }
+
+[[bin]]
+name = "greentic-runner-full"
+path = "src/bin/greentic_runner_full.rs"

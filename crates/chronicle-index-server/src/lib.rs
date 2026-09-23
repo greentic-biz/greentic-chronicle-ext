@@ -34,6 +34,10 @@ fn tenant_routes() -> Router<AppState> {
             "/v1/indexes/{index_id}/documents/{document_id}",
             delete(routes::documents::delete_document),
         )
+        .route(
+            "/v1/indexes/{index_id}/search",
+            post(routes::search::search),
+        )
 }
 
 pub fn router(state: AppState, max_body_bytes: usize) -> Router {

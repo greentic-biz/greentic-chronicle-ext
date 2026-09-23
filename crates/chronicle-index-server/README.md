@@ -12,7 +12,7 @@ view the designer uses to confirm a sync landed.
 
 ## Running it
 
-Four environment variables configure the process:
+Five environment variables configure the process:
 
 | Variable | Required | Default |
 |---|---|---|
@@ -20,6 +20,20 @@ Four environment variables configure the process:
 | `CHRONICLE_INDEX_DATA_DIR` | yes | none — the process refuses to start without one |
 | `CHRONICLE_INDEX_BIND` | no | `0.0.0.0:8088` |
 | `CHRONICLE_INDEX_MAX_BODY_BYTES` | no | `16777216` (16 MiB) |
+| `CHRONICLE_INDEX_ALLOWED_DIMS` | no | `384,768,1024,1536,3072` |
+
+`CHRONICLE_INDEX_ALLOWED_DIMS` is the comma-separated list of embedding
+dimensions an index may be created with; `PUT /v1/indexes/{index_id}` with
+any other `dims` answers `400 bad_request` ("dims N is not allowed on this
+server"). Each distinct dimension opens its own graph store for the life of
+the process, so this bounds how many stores tenants can make the server
+open. An empty list, a non-integer, `0`, or a value above 8192 stops the
+server at startup rather than falling back to the default.
+
+**Serve it at the root of its URL.** The designer builds every request URL
+with `Url::join("/v1/...")`, which replaces any path on the base URL — a
+server published as `https://host/chronicle/` receives requests at
+`https://host/v1/...` and never sees them. Give it its own host or port.
 
 Build and run the Docker image:
 
@@ -63,12 +77,12 @@ error leaves as `{"error":{"code","message"}}`.
 | `POST /admin/v1/keys` | bootstrap | `201` | `unauthorized`, `bad_request` |
 | `GET /admin/v1/keys` | bootstrap | `200` | `unauthorized` |
 | `DELETE /admin/v1/keys/{key_id}` | bootstrap | `204` | `unauthorized`, `key_not_found` |
-| `PUT /v1/indexes/{index_id}` | tenant key | `200` (existing) / `201` (created) | `unauthorized`, `bad_request`, `model_mismatch`, `dim_mismatch`, 413 |
+| `PUT /v1/indexes/{index_id}` | tenant key | `200` (existing) / `201` (created) | `unauthorized`, `bad_request`, `model_mismatch`, `dim_mismatch`, `payload_too_large` (413) |
 | `DELETE /v1/indexes/{index_id}` | tenant key | `204` | `unauthorized`, `bad_request`, `index_not_found` |
 | `GET /v1/indexes/{index_id}/stats` | tenant key | `200` | `unauthorized`, `bad_request`, `index_not_found` |
-| `POST /v1/indexes/{index_id}/documents` | tenant key | `200` | `unauthorized`, `bad_request`, `index_not_found`, `dim_mismatch`, 413 |
+| `POST /v1/indexes/{index_id}/documents` | tenant key | `200` | `unauthorized`, `bad_request`, `index_not_found`, `dim_mismatch`, `payload_too_large` (413) |
 | `DELETE /v1/indexes/{index_id}/documents/{document_id}` | tenant key | `204` | `unauthorized`, `bad_request`, `index_not_found`, `document_not_found` |
-| `POST /v1/indexes/{index_id}/search` | tenant key | `200` | `unauthorized`, `bad_request`, `index_not_found`, `dim_mismatch`, 413 |
+| `POST /v1/indexes/{index_id}/search` | tenant key | `200` | `unauthorized`, `bad_request`, `index_not_found`, `dim_mismatch`, `payload_too_large` (413) |
 
 A document id or index id carrying a control character, or that is empty or
 blank, answers `bad_request` — never reaching the store, since the meta
@@ -88,9 +102,11 @@ directory; there is no live-backup path.
 
 - Single replica only — the storage layer takes an exclusive lock on the
   data directory.
-- HNSW post-filtering by tenant/team/index can lower recall in a store
-  holding very many indexes, since the graph's approximate search runs
-  before the tenant filter narrows the result set.
+- The vector half of search is an exact cosine scan of the searched
+  index's own chunks, not the store's shared HNSW graph, so another index in
+  the same store can never crowd it out. Its cost grows with the size of
+  that one index, not with the size of the store; very large single indexes
+  pay for that exactness on every search.
 - `GET /v1/indexes/{index_id}/stats` reads the meta records (document and
   chunk-index counts kept beside each document), not a scan of the graph
   store.

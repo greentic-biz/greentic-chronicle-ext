@@ -142,3 +142,69 @@ async fn an_empty_query_or_zero_limit_returns_nothing() {
             .is_empty()
     );
 }
+
+fn mixed(primary: usize, secondary: usize, weight: f32) -> Vec<f32> {
+    let mut v = unit(primary);
+    v[secondary] += weight;
+    let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    v.iter().map(|x| x / norm).collect()
+}
+
+#[tokio::test]
+async fn the_exact_cosine_scan_stays_inside_its_groups_and_ranks_every_chunk() {
+    use chronicle_core::driver::EntityNodeOps as _;
+
+    let driver = SurrealDriver::connect_memory(DIMS).await.expect("driver");
+    let mine = "idx:acme:general:kb1";
+    ingest_chunks_with_vectors(
+        &driver,
+        &[
+            chunk("far", 0, "far chunk", Some(mixed(0, 1, 2.0))),
+            chunk("near", 0, "near chunk", Some(mixed(0, 1, 0.1))),
+            chunk("orthogonal", 0, "orthogonal chunk", Some(unit(3))),
+        ],
+        mine,
+        DIMS,
+    )
+    .await
+    .expect("ingest mine");
+    // Another group, every chunk nearer to the query than any of mine.
+    let crowd: Vec<_> = (0..50)
+        .map(|i| chunk("crowd", i, "crowd", Some(unit(0))))
+        .collect();
+    ingest_chunks_with_vectors(&driver, &crowd, "idx:other:general:kb1", DIMS)
+        .await
+        .expect("ingest crowd");
+    // A plain entity in my group is not a document chunk.
+    let mut entity =
+        chronicle_core::types::EntityNode::new("an entity".into(), mine.into(), chrono::Utc::now());
+    entity.name_embedding = Some(unit(0));
+    driver
+        .save_entity_nodes(&[entity])
+        .await
+        .expect("save entity");
+
+    let hits = driver
+        .document_chunks_by_cosine(&[mine.to_string()], &unit(0), 10)
+        .await
+        .expect("scan");
+    let names: Vec<_> = hits.iter().map(|(n, _)| n.name.as_str()).collect();
+    assert_eq!(names, ["near chunk", "far chunk", "orthogonal chunk"]);
+    assert!(hits.iter().all(|(n, _)| n.group_id == mine));
+    assert!(hits[0].1 > hits[1].1 && hits[1].1 > hits[2].1);
+    assert!((hits[2].1).abs() < 1e-6, "orthogonal scores 0");
+
+    let top = driver
+        .document_chunks_by_cosine(&[mine.to_string()], &unit(0), 1)
+        .await
+        .expect("scan");
+    assert_eq!(top.len(), 1);
+    assert!(
+        driver
+            .document_chunks_by_cosine(&[], &unit(0), 10)
+            .await
+            .expect("scan")
+            .is_empty(),
+        "no group means no rows, never the whole store"
+    );
+}

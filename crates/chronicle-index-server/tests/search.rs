@@ -120,7 +120,7 @@ async fn a_huge_limit_is_clamped_and_a_missing_index_is_404() {
 }
 
 fn unit_mix(primary: usize, secondary: usize, weight: f32) -> String {
-    let mut v = vec![0.0_f32; DIMS];
+    let mut v = [0.0_f32; DIMS];
     v[primary] = 1.0;
     v[secondary] += weight;
     let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();

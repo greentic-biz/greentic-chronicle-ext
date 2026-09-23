@@ -26,9 +26,12 @@ use greentic_dw_embedding_openai_compatible::{
 };
 use greentic_dw_llm::LlmProvider;
 use greentic_dw_llm_openai_compatible::{OpenAiCompatibleConfig, OpenAiCompatibleProvider};
+// The provider's own type is aliased: this module also exports an extension
+// called `ChronicleLongTermMemory` (below), matching `ChronicleKnowledge` next
+// door, and the two names would otherwise collide in this one module.
 use greentic_dw_memory_chronicle::{
-    ChronicleBackend, ChronicleLongTermMemory, ChronicleMemoryConfig, DEFAULT_FALKOR_GRAPH,
-    DEFAULT_NEO4J_DATABASE,
+    ChronicleBackend, ChronicleLongTermMemory as ChronicleMemoryProvider, ChronicleMemoryConfig,
+    DEFAULT_FALKOR_GRAPH, DEFAULT_NEO4J_DATABASE,
 };
 use greentic_runner_host::runner::runtime_ext::AgentRuntimeExtension;
 use greentic_types::{EnvId, TenantCtx, TenantId};
@@ -103,7 +106,7 @@ pub(crate) async fn attach(runtime: AgentRuntime) -> AgentRuntime {
     config.embedding_dim = Some(embedding_dim);
     let backend_kind = config.backend.kind();
 
-    match ChronicleLongTermMemory::connect_with_dw_providers(
+    match ChronicleMemoryProvider::connect_with_dw_providers(
         config,
         llm,
         embedder,
@@ -242,6 +245,19 @@ fn operator_tenant() -> TenantCtx {
     let tenant = TenantId::try_from("chronicle")
         .expect("the literal tenant id \"chronicle\" is always valid");
     TenantCtx::new(env, tenant)
+}
+
+/// The long-term-memory tier as an agent-runtime extension.
+///
+/// Registered by `greentic-runner-full`; see this crate's docs for why it is
+/// not compiled into greentic-runner-host any more.
+pub struct ChronicleLongTermMemory;
+
+#[async_trait::async_trait]
+impl AgentRuntimeExtension for ChronicleLongTermMemory {
+    async fn attach(&self, rt: AgentRuntime) -> AgentRuntime {
+        attach(rt).await
+    }
 }
 
 #[cfg(test)]
@@ -428,18 +444,5 @@ mod tests {
         set(ENV_BACKEND, "cassandra");
         assert!(select_backend().is_none());
         clear_backend_env();
-    }
-}
-
-/// The long-term-memory tier as an agent-runtime extension.
-///
-/// Registered by `greentic-runner-full`; see this crate's docs for why it is
-/// not compiled into greentic-runner-host any more.
-pub struct ChronicleLongTermMemory;
-
-#[async_trait::async_trait]
-impl AgentRuntimeExtension for ChronicleLongTermMemory {
-    async fn attach(&self, rt: AgentRuntime) -> AgentRuntime {
-        attach(rt).await
     }
 }

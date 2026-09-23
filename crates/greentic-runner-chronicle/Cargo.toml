@@ -15,13 +15,15 @@ description = "Chronicle long-term memory and knowledge backends as greentic-run
 
 [dependencies]
 # The seam. `runtime_ext::AgentRuntimeExtension` and `cli_main` landed in
-# greentic-runner#787; until that merges these two git requirements do not
-# resolve. Both come from ONE git source (url + branch) so the runner's own
-# path deps unify with them instead of resolving a second copy.
-greentic-runner-host = { git = "https://github.com/greenticai/greentic-runner", branch = "develop" }
-greentic-aw-runtime = { git = "https://github.com/greenticai/greentic-runner", branch = "develop" }
+# greentic-runner#787, and the first lane build carrying it is
+# 1.2.0-dev.35804394619 — so these are plain crates.io requirements rather than
+# the git pins this branch opened with. All three are published from ONE
+# workspace per run, so the lane range resolves them to one build and the
+# runner's own internal deps unify instead of resolving a second copy.
+greentic-runner-host = { version = ">=1.2.0-dev, <1.3.0-0" }
+greentic-aw-runtime = { version = ">=1.2.0-dev, <1.3.0-0" }
 # Only the binary needs this one: `cli_main()` is greentic-runner's whole `main`.
-greentic-runner = { git = "https://github.com/greenticai/greentic-runner", branch = "develop" }
+greentic-runner = { version = ">=1.2.0-dev, <1.3.0-0" }
 
 greentic-dw-memory-chronicle = { workspace = true }
 greentic-dw-knowledge-chronicle = { workspace = true, features = ["surreal", "neo4j"] }
@@ -49,6 +51,9 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 serial_test = "3"
+# `knowledge_mount`'s moved corpus test builds a throwaway directory. It was a
+# dev-dependency of greentic-runner-host, which is where this test lived.
+tempfile = { workspace = true }
 
 [[bin]]
 name = "greentic-runner-full"

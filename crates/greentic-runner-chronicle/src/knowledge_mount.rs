@@ -454,6 +454,29 @@ async fn ingest_corpus(tenant: &TenantCtx, chunks: Vec<AwChunk>) {
     // absorbs that window.
 }
 
+/// The knowledge (document-RAG) tier as an agent-runtime extension.
+///
+/// Carries all three hooks: the serving mount, the embedder the host validates
+/// a pack's precomputed vectors against, and the first-boot corpus ingest —
+/// which the host runs before any runtime is built, because the embedded store
+/// allows one handle per directory.
+pub struct ChronicleKnowledge;
+
+#[async_trait::async_trait]
+impl AgentRuntimeExtension for ChronicleKnowledge {
+    async fn attach(&self, rt: AgentRuntime) -> AgentRuntime {
+        attach(rt).await
+    }
+
+    fn embedding_expectation(&self) -> Option<(String, usize)> {
+        embedding_expectation()
+    }
+
+    async fn ingest_corpus(&self, tenant: &TenantCtx, chunks: Vec<AwChunk>) {
+        ingest_corpus(tenant, chunks).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -768,28 +791,5 @@ mod tests {
             Some("text-embedding-3-small")
         );
         clear_embed_env();
-    }
-}
-
-/// The knowledge (document-RAG) tier as an agent-runtime extension.
-///
-/// Carries all three hooks: the serving mount, the embedder the host validates
-/// a pack's precomputed vectors against, and the first-boot corpus ingest —
-/// which the host runs before any runtime is built, because the embedded store
-/// allows one handle per directory.
-pub struct ChronicleKnowledge;
-
-#[async_trait::async_trait]
-impl AgentRuntimeExtension for ChronicleKnowledge {
-    async fn attach(&self, rt: AgentRuntime) -> AgentRuntime {
-        attach(rt).await
-    }
-
-    fn embedding_expectation(&self) -> Option<(String, usize)> {
-        embedding_expectation()
-    }
-
-    async fn ingest_corpus(&self, tenant: &TenantCtx, chunks: Vec<AwChunk>) {
-        ingest_corpus(tenant, chunks).await;
     }
 }

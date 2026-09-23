@@ -84,6 +84,11 @@ pub async fn search(
     let limit = usize::try_from(body.limit.clamp(1, MAX_SEARCH_LIMIT)).unwrap_or(1);
     // Each leg fetches twice the answer, as chronicle's `node_search` does,
     // so fusion has something to reorder.
+    // An index nobody has synced into has nothing to rank, and opening its
+    // dimension's store just to learn that would create one on disk.
+    if state.meta.list_docs(&group_id).await?.is_empty() {
+        return Ok(Json(SearchResponse { chunks: Vec::new() }));
+    }
     let candidates = limit.saturating_mul(2);
     let groups = [group_id];
     let driver = state.graphs.for_dims(dims).await?;

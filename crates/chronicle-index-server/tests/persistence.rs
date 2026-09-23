@@ -76,3 +76,29 @@ async fn state_survives_reopen_on_disk() {
     .await;
     assert_eq!(found["chunks"][0]["document_id"], "d1");
 }
+
+#[tokio::test]
+async fn searching_an_empty_index_opens_no_graph_store() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let app = router(
+        AppState::open(&config(dir.path())).await.expect("open"),
+        1 << 20,
+    );
+    let key = mint(&app, "acme", &["*"]).await;
+    let h = tenant_headers(&key, "acme", None);
+    create_index(&app, &h, "kb1").await;
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/v1/indexes/kb1/search",
+        &h,
+        Some(json!({"query": "anything", "vector_b64": vec_b64(0)})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["chunks"], json!([]));
+    assert!(
+        !dir.path().join(format!("dim-{DIMS}")).exists(),
+        "no store was created for an index with no documents"
+    );
+}

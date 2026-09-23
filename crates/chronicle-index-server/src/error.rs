@@ -1,8 +1,11 @@
 use std::fmt::Display;
 
 use axum::Json;
+use axum::extract::rejection::JsonRejection;
+use axum::extract::{FromRequest, Request};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use serde::de::DeserializeOwned;
 
 /// Every error leaves as `{"error":{"code","message"}}`. The designer acts on
 /// `code` only; `message` is for logs and never carries a key, a document
@@ -96,6 +99,39 @@ impl From<chronicle_core::ChronicleError> for ApiError {
             chronicle_core::ChronicleError::InvalidInput(msg) => Self::bad_request(msg),
             other => Self::internal(other),
         }
+    }
+}
+
+/// A `Json<T>` that answers a bad body with this crate's `{"error":{...}}`
+/// envelope instead of axum's own plain-text rejection body. Handlers taking
+/// a request body should use this in place of `axum::Json`; responses keep
+/// using `axum::Json` directly.
+pub struct ApiJson<T>(pub T);
+
+impl<T, S> FromRequest<S> for ApiJson<T>
+where
+    T: DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        match Json::<T>::from_request(req, state).await {
+            Ok(Json(value)) => Ok(Self(value)),
+            Err(rejection) => Err(api_error_from_json_rejection(rejection)),
+        }
+    }
+}
+
+fn api_error_from_json_rejection(rejection: JsonRejection) -> ApiError {
+    if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "payload_too_large",
+            "request body too large",
+        )
+    } else {
+        ApiError::bad_request(rejection.body_text())
     }
 }
 

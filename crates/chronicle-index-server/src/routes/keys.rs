@@ -3,14 +3,14 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 
 use crate::auth::{ALL_TEAMS, generate_api_key, hash_key};
-use crate::error::ApiError;
+use crate::error::{ApiError, ApiJson};
 use crate::meta::{KeyRecord, now_ms, rfc3339};
 use crate::state::AppState;
 use crate::wire::{CreateKeyRequest, CreateKeyResponse, KeyView, valid_slug};
 
 pub async fn create(
     State(state): State<AppState>,
-    Json(body): Json<CreateKeyRequest>,
+    ApiJson(body): ApiJson<CreateKeyRequest>,
 ) -> Result<(StatusCode, Json<CreateKeyResponse>), ApiError> {
     if !valid_slug(&body.tenant_slug) {
         return Err(ApiError::bad_request("invalid tenant_slug"));

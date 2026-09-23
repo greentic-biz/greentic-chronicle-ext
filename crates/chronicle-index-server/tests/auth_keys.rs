@@ -1,7 +1,10 @@
 mod common;
 
-use axum::http::StatusCode;
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
 use common::*;
+use http_body_util::BodyExt as _;
+use tower::ServiceExt as _;
 
 #[tokio::test]
 async fn healthz_needs_no_key() {
@@ -152,4 +155,54 @@ async fn missing_team_means_general() {
         StatusCode::NOT_FOUND,
         "authorised; the index simply does not exist yet"
     );
+}
+
+#[tokio::test]
+async fn malformed_json_answers_the_error_envelope_not_axums_plain_text() {
+    let app = app().await;
+    let req = Request::builder()
+        .method("POST")
+        .uri("/admin/v1/keys")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {BOOTSTRAP}"))
+        .body(Body::from("{not valid json"))
+        .expect("request");
+    let resp = app.clone().oneshot(req).await.expect("oneshot");
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let bytes = resp.into_body().collect().await.expect("body").to_bytes();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
+    assert_eq!(body["error"]["code"], "bad_request");
+}
+
+#[tokio::test]
+async fn a_field_of_the_wrong_json_type_answers_the_error_envelope() {
+    let app = app().await;
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/admin/v1/keys",
+        &bootstrap_headers(),
+        Some(serde_json::json!({"tenant_slug": 5, "teams": ["*"]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "bad_request");
+}
+
+#[tokio::test]
+async fn a_missing_content_type_answers_the_error_envelope_not_axums_plain_text() {
+    let app = app().await;
+    let req = Request::builder()
+        .method("POST")
+        .uri("/admin/v1/keys")
+        .header("authorization", format!("Bearer {BOOTSTRAP}"))
+        .body(Body::from(
+            serde_json::json!({"tenant_slug": "acme", "teams": ["*"]}).to_string(),
+        ))
+        .expect("request");
+    let resp = app.clone().oneshot(req).await.expect("oneshot");
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let bytes = resp.into_body().collect().await.expect("body").to_bytes();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
+    assert_eq!(body["error"]["code"], "bad_request");
 }

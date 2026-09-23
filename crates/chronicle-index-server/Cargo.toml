@@ -1,0 +1,37 @@
+[package]
+name = "chronicle-index-server"
+description = "HTTP knowledge-index server (/v1/indexes) over chronicle document RAG"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "chronicle-index-server"
+path = "src/main.rs"
+
+[dependencies]
+chronicle-core.workspace = true
+chronicle-driver-surreal.workspace = true
+surrealdb.workspace = true
+axum.workspace = true
+tokio = { workspace = true, features = ["net", "signal"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+rand.workspace = true
+sha2.workspace = true
+base64.workspace = true
+subtle.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
+tower.workspace = true
+http-body-util.workspace = true
+tempfile.workspace = true

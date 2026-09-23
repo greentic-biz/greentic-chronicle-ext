@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     # restored as crates land (tasks 2, 9, 15, 16)
     "crates/chronicle-core",
+    "crates/chronicle-index-server",
     "crates/chronicle-testkit",
     "crates/chronicle-driver-neo4j",
     "crates/chronicle-driver-surreal",
@@ -26,6 +27,14 @@ rust-version = "1.95"
 
 [workspace.dependencies]
 chronicle-core = { path = "crates/chronicle-core" }
+chronicle-index-server = { path = "crates/chronicle-index-server" }
+axum = "0.8"
+sha2 = "0.10"
+base64 = "0.22"
+subtle = "2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
 chronicle-testkit = { path = "crates/chronicle-testkit" }
 chronicle-driver-neo4j = { path = "crates/chronicle-driver-neo4j" }
 chronicle-driver-surreal = { path = "crates/chronicle-driver-surreal" }

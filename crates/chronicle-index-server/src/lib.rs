@@ -21,24 +21,18 @@ use crate::state::AppState;
 
 fn tenant_routes() -> Router<AppState> {
     Router::new()
+        .route(
+            "/v1/indexes/{index_id}",
+            axum::routing::put(routes::indexes::put_index).delete(routes::indexes::delete_index),
+        )
+        .route("/v1/indexes/{index_id}/stats", get(routes::indexes::stats))
 }
 
 pub fn router(state: AppState, max_body_bytes: usize) -> Router {
-    // `route_layer` panics if applied to a router with no routes yet
-    // registered ("Adding a route_layer before any routes is a no-op").
-    // `tenant_routes()` is empty until Task 5 adds the first `/v1` route, so
-    // the guard is skipped until there is something for it to guard — an
-    // unguarded empty router still answers every `/v1` request with 404,
-    // which is exactly what the auth_keys tests expect before Task 5 lands.
-    let tenant = tenant_routes();
-    let tenant = if tenant.has_routes() {
-        tenant.route_layer(middleware::from_fn_with_state(
-            state.clone(),
-            auth::require_tenant_key,
-        ))
-    } else {
-        tenant
-    };
+    let tenant = tenant_routes().route_layer(middleware::from_fn_with_state(
+        state.clone(),
+        auth::require_tenant_key,
+    ));
     let admin = Router::new()
         .route(
             "/admin/v1/keys",

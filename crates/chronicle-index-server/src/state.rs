@@ -85,6 +85,7 @@ pub struct AppState {
     pub meta: MetaStore,
     pub graphs: Arc<GraphPool>,
     pub locks: Arc<IndexLocks>,
+    allowed_dims: Arc<[usize]>,
     bootstrap_hash: Arc<[u8; 32]>,
 }
 
@@ -101,18 +102,28 @@ impl AppState {
             meta: MetaStore::open(&meta_dir).await?,
             graphs: Arc::new(GraphPool::new(GraphBackend::Disk(cfg.data_dir.clone()))),
             locks: Arc::new(IndexLocks::default()),
+            allowed_dims: Arc::from(cfg.allowed_dims.as_slice()),
             bootstrap_hash: Arc::new(sha256(cfg.bootstrap_key.as_bytes())),
         })
     }
 
     /// Everything in memory — for tests and local experiments.
-    pub async fn in_memory(bootstrap_key: &str) -> Result<Self, StartupError> {
+    pub async fn in_memory(
+        bootstrap_key: &str,
+        allowed_dims: &[usize],
+    ) -> Result<Self, StartupError> {
         Ok(Self {
             meta: MetaStore::memory().await?,
             graphs: Arc::new(GraphPool::new(GraphBackend::Memory)),
             locks: Arc::new(IndexLocks::default()),
+            allowed_dims: Arc::from(allowed_dims),
             bootstrap_hash: Arc::new(sha256(bootstrap_key.as_bytes())),
         })
+    }
+
+    /// Whether an index may be created with `dims` on this server.
+    pub fn allows_dims(&self, dims: i64) -> bool {
+        usize::try_from(dims).is_ok_and(|d| self.allowed_dims.contains(&d))
     }
 
     pub fn bootstrap_hash(&self) -> &[u8; 32] {

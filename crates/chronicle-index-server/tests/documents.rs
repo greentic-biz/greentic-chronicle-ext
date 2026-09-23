@@ -183,7 +183,7 @@ async fn an_interrupted_write_leaves_no_permanently_orphaned_chunks() {
     // graph — but the process died before the FINAL record (new hash, new
     // indexes) was ever written. A later upsert (v3) must still clean up
     // every chunk the intent record named, even ones it never itself wrote.
-    let state = chronicle_index_server::state::AppState::in_memory(BOOTSTRAP)
+    let state = chronicle_index_server::state::AppState::in_memory(BOOTSTRAP, ALLOWED_DIMS)
         .await
         .expect("state");
     let app = chronicle_index_server::router(state.clone(), 16 * 1024 * 1024);
@@ -307,7 +307,7 @@ async fn deleting_the_index_removes_its_chunks_from_search() {
 
 #[tokio::test]
 async fn an_oversized_body_is_413() {
-    let state = chronicle_index_server::state::AppState::in_memory(BOOTSTRAP)
+    let state = chronicle_index_server::state::AppState::in_memory(BOOTSTRAP, ALLOWED_DIMS)
         .await
         .expect("state");
     let small = chronicle_index_server::router(state, 1024);

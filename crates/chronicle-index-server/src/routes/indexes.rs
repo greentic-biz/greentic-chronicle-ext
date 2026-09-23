@@ -34,13 +34,19 @@ fn view(index: &IndexRecord) -> IndexView {
     }
 }
 
-fn validate(body: &PutIndexRequest) -> Result<(), ApiError> {
+fn validate(body: &PutIndexRequest, state: &AppState) -> Result<(), ApiError> {
     if body.embedding_model.trim().is_empty() {
         return Err(ApiError::bad_request("embedding_model is required"));
     }
     if !(1..=MAX_DIMS).contains(&body.dims) {
         return Err(ApiError::bad_request(format!(
             "dims must be between 1 and {MAX_DIMS}"
+        )));
+    }
+    if !state.allows_dims(body.dims) {
+        return Err(ApiError::bad_request(format!(
+            "dims {} is not allowed on this server",
+            body.dims
         )));
     }
     if body.chunk_size < 1 || body.chunk_overlap < 0 {
@@ -58,7 +64,7 @@ pub async fn put_index(
     ApiJson(body): ApiJson<PutIndexRequest>,
 ) -> Result<(StatusCode, Json<IndexView>), ApiError> {
     let group_id = scope.group_id(&index_id)?;
-    validate(&body)?;
+    validate(&body, &state)?;
     let _guard = state.locks.lock(&group_id).await;
     let now = now_ms();
     match state.meta.get_index(&group_id).await? {

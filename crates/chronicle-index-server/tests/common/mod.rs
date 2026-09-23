@@ -11,9 +11,14 @@ use tower::ServiceExt as _;
 
 pub const BOOTSTRAP: &str = "bootstrap-key-for-tests-0123456789abcdef";
 pub const DIMS: usize = 4;
+/// Every dimension the tests create an index with (`DIMS`, and 8 for the
+/// dimension-conflict test).
+pub const ALLOWED_DIMS: &[usize] = &[DIMS, 8];
 
 pub async fn app() -> Router {
-    let state = AppState::in_memory(BOOTSTRAP).await.expect("state");
+    let state = AppState::in_memory(BOOTSTRAP, ALLOWED_DIMS)
+        .await
+        .expect("state");
     router(state, 16 * 1024 * 1024)
 }
 

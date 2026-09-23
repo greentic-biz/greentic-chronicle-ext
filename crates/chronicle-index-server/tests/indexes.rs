@@ -70,6 +70,29 @@ async fn put_refuses_out_of_range_values() {
 }
 
 #[tokio::test]
+async fn a_dimension_the_server_does_not_allow_is_refused() {
+    let (app, h) = setup().await;
+    let (status, body) = call(
+        &app,
+        "PUT",
+        "/v1/indexes/kb1",
+        &h,
+        Some(
+            json!({"name":"x","embedding_model":"m","dims":16,"chunk_size":1000,"chunk_overlap":0}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "bad_request");
+    assert_eq!(
+        body["error"]["message"],
+        "dims 16 is not allowed on this server"
+    );
+    let (status, _) = call(&app, "GET", "/v1/indexes/kb1/stats", &h, None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "nothing was created");
+}
+
+#[tokio::test]
 async fn stats_of_an_empty_index_and_of_a_missing_one() {
     let (app, h) = setup().await;
     let (status, body) = call(&app, "GET", "/v1/indexes/kb1/stats", &h, None).await;

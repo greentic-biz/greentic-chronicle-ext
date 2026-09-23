@@ -11,6 +11,7 @@ fn config(dir: &std::path::Path) -> Config {
     Config::from_lookup(|name| match name {
         "CHRONICLE_INDEX_BOOTSTRAP_KEY" => Some(BOOTSTRAP.to_string()),
         "CHRONICLE_INDEX_DATA_DIR" => Some(dir.display().to_string()),
+        "CHRONICLE_INDEX_ALLOWED_DIMS" => Some(DIMS.to_string()),
         _ => None,
     })
     .expect("config")

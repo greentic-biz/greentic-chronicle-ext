@@ -176,6 +176,28 @@ async fn an_unsafe_document_id_against_a_missing_index_is_400_not_404() {
 }
 
 #[tokio::test]
+async fn a_blank_content_hash_is_refused_before_anything_is_read_or_written() {
+    let (app, h) = setup().await;
+    for hash in ["", "   "] {
+        let (status, body) = upsert(&app, &h, vec![document("d1", hash, &[(0, "text", 0)])]).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{hash:?}: {body}");
+        assert_eq!(body["error"]["code"], "bad_request");
+    }
+    assert_eq!(stats(&app, &h).await["document_count"], 0);
+
+    // Refused before the index is even looked up.
+    let (status, _) = call(
+        &app,
+        "POST",
+        "/v1/indexes/missing/documents",
+        &h,
+        Some(json!({"documents": [document("d1", " ", &[(0, "text", 0)])]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn an_interrupted_write_leaves_no_permanently_orphaned_chunks() {
     // Simulates a crash mid-upsert: an "intent" record naming a hypothetical
     // v2's chunks has already been written under the OLD hash, and the v2

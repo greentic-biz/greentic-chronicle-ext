@@ -74,10 +74,16 @@ pub async fn upsert(
 ) -> Result<Json<UpsertResponse>, ApiError> {
     // Checked first thing, before the index is even looked up: an unsafe id
     // must answer 400 regardless of whether the index exists, never a 404
-    // that leaks index existence past a bad request.
+    // that leaks index existence past a bad request. A blank content_hash is
+    // refused here too: "" is the hash an intent record carries for a
+    // document with no previous version, so accepting it would let a
+    // half-written document be skipped as unchanged.
     for doc in &body.documents {
         if !valid_document_id(&doc.document_id) {
             return Err(ApiError::bad_request("document_id is invalid"));
+        }
+        if doc.content_hash.trim().is_empty() {
+            return Err(ApiError::bad_request("content_hash is required"));
         }
     }
     let group_id = scope.group_id(&index_id)?;
@@ -121,6 +127,13 @@ pub async fn upsert(
         // once the new chunks are ingested and every stale one is gone do
         // we write the FINAL record — the new hash, and only the new
         // indexes.
+        //
+        // Known gap: if an upsert fails after its intent record, and the
+        // very next upsert of this document reverts to the previously
+        // recorded content, its hash matches the intent record's (old)
+        // hash, so it is counted unchanged while the failed attempt's newer
+        // chunk text is still what is stored. The next real content change
+        // repairs it.
         let previous_hash = previous
             .as_ref()
             .map(|p| p.content_hash.clone())

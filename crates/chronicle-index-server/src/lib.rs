@@ -26,6 +26,14 @@ fn tenant_routes() -> Router<AppState> {
             axum::routing::put(routes::indexes::put_index).delete(routes::indexes::delete_index),
         )
         .route("/v1/indexes/{index_id}/stats", get(routes::indexes::stats))
+        .route(
+            "/v1/indexes/{index_id}/documents",
+            post(routes::documents::upsert),
+        )
+        .route(
+            "/v1/indexes/{index_id}/documents/{document_id}",
+            delete(routes::documents::delete_document),
+        )
 }
 
 pub fn router(state: AppState, max_body_bytes: usize) -> Router {

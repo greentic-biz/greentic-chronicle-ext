@@ -1,0 +1,34 @@
+[package]
+name = "greentic-dw-memory-chronicle"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+# Moved from greenticai/greentic-dw-providers (MIT) so that workspace can
+# publish to crates.io without git-only chronicle deps. Never published.
+license = "MIT"
+publish = false
+repository.workspace = true
+readme = "README.md"
+description = "Chronicle-backed long-term memory provider for Greentic DW."
+
+[dependencies]
+greentic-dw-memory-long-term = { workspace = true }
+greentic-dw-llm = { workspace = true }
+greentic-dw-embedding = { workspace = true }
+greentic-types = { workspace = true }
+chronicle-core = { workspace = true }
+chronicle-driver-neo4j = { workspace = true }
+chronicle-driver-surreal = { workspace = true }
+chronicle-driver-falkor = { workspace = true }
+chronicle-llm-openai = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing.workspace = true
+
+[dev-dependencies]
+chronicle-testkit = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

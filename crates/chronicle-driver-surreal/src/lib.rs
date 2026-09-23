@@ -27,6 +27,7 @@
 //! `datetime`s — proven by the `datetime_is_stored_as_datetime` test.
 
 mod convert;
+mod document_chunks;
 mod filters;
 mod schema;
 

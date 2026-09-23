@@ -13,5 +13,8 @@ pub mod prompts;
 pub mod search;
 pub mod types;
 
-pub use document_rag::{DOCUMENT_CHUNK_LABEL, DocumentChunk, DocumentChunkHit, chunk_text};
+pub use document_rag::{
+    DOCUMENT_CHUNK_LABEL, DocumentChunk, DocumentChunkHit, chunk_text, chunk_uuid,
+    ingest_chunks_with_vectors, search_chunks_by_vector,
+};
 pub use errors::ChronicleError;

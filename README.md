@@ -21,6 +21,17 @@ workspace so Greentic digital workers gain long-term, bi-temporal, graph-structu
 | `chronicle-driver-falkor` | `GraphDriver` implementation over **FalkorDB** (`falkordb` 0.2.1) — openCypher on a Redis module; a Cypher-dialect adaptation of the Neo4j driver |
 | `chronicle-llm-openai` | `LlmClient` + `EmbedderClient` over OpenAI-compatible endpoints via `async-openai` |
 | `chronicle-testkit` | `FakeDriver`, `MockLlm`, `MockEmbedder` for deterministic unit tests; driver-conformance integration tests |
+| `greentic-dw-memory-chronicle` | Chronicle-backed `LongTermMemory` provider for Greentic DW (`publish = false`) |
+| `greentic-dw-knowledge-chronicle` | Chronicle-backed `Knowledge` (document-RAG) provider for Greentic DW (`publish = false`) |
+
+The two `greentic-dw-*` crates moved here from `greenticai/greentic-dw-providers`
+on 2026-09-23. They are the only crates that bind the DW provider contracts to
+`chronicle-*`, and a git-only dependency blocks `cargo publish` for the whole
+workspace it sits in — so that workspace publishes its contract crates to
+crates.io, and the adapters live here. They take
+`greentic-dw-memory-long-term`, `greentic-dw-knowledge`, `greentic-dw-llm`,
+`greentic-dw-embedding` and `greentic-types` from the crates.io `1.2.0-dev`
+lane, and are never published themselves.
 
 ### Graph backends
 

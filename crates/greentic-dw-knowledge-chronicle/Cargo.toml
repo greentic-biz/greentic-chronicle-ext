@@ -1,0 +1,40 @@
+[package]
+name = "greentic-dw-knowledge-chronicle"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+# Moved from greenticai/greentic-dw-providers (MIT) so that workspace can
+# publish to crates.io without git-only chronicle deps. Never published.
+license = "MIT"
+publish = false
+repository.workspace = true
+readme = "README.md"
+description = "Chronicle-backed knowledge (document-RAG) provider for Greentic DW."
+
+[dependencies]
+greentic-dw-knowledge = { workspace = true }
+greentic-dw-embedding = { workspace = true }
+greentic-dw-llm = { workspace = true }
+greentic-types = { workspace = true }
+chronicle-core = { workspace = true }
+chronicle-llm-openai = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+# Real graph drivers — optional so the default build needs no bindgen / RocksDB.
+chronicle-driver-neo4j = { workspace = true, optional = true }
+chronicle-driver-surreal = { workspace = true, optional = true }
+
+[features]
+default = []
+neo4j = ["dep:chronicle-driver-neo4j"]
+surreal = ["dep:chronicle-driver-surreal"]
+
+[dev-dependencies]
+chronicle-testkit = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

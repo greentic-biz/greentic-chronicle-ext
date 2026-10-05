@@ -11,10 +11,14 @@
 //!   endpoints by uuid directly. The uuid is ALSO stored as a plain `uuid`
 //!   string field so row structs deserialize cleanly without parsing the
 //!   record id key back out.
-//! - **`OVERWRITE` everywhere** (not `IF NOT EXISTS`): re-running the DDL is a
-//!   clean redefinition, which is exactly what `build_indices_and_constraints`
-//!   needs (idempotent connect + `delete_existing` rebuild). Verified against
-//!   surrealdb 3.1.3.
+//! - **Two DDL flavours.** [`schema_ddl`] uses `OVERWRITE`: a clean
+//!   redefinition, which is what `build_indices_and_constraints` needs
+//!   (explicit rebuild). [`schema_ddl_if_missing`] uses `IF NOT EXISTS` and is
+//!   what runs on every connect. The difference is not cosmetic: `DEFINE INDEX
+//!   OVERWRITE` rebuilds the index over every row already stored, so running
+//!   it on connect made opening a populated store take minutes (HNSW + five
+//!   full-text indexes) and held the caller's request open the whole time.
+//!   Verified against surrealdb 3.1.3.
 //! - **Tables are `SCHEMALESS`**: attributes are open-ended JSON, so we only
 //!   `DEFINE FIELD` the columns that need a declared type for indexing
 //!   (embeddings as `option<array<float>>`, group_id as `string`, datetimes).
@@ -34,8 +38,9 @@ pub const ANALYZER: &str = "chronicle_ascii";
 /// Build the full schema DDL as a single multi-statement SurrealQL string.
 ///
 /// `embedding_dim` parameterises the HNSW vector-index `DIMENSION`. The whole
-/// string is idempotent (`OVERWRITE`), so it is safe to run on every connect and
-/// to re-run for `build_indices_and_constraints`.
+/// string is idempotent (`OVERWRITE`) but every `DEFINE INDEX` it contains
+/// REBUILDS that index over the stored data. Use it for an explicit rebuild
+/// (`build_indices_and_constraints`); connecting uses [`schema_ddl_if_missing`].
 pub fn schema_ddl(embedding_dim: usize) -> String {
     let mut ddl = String::new();
 
@@ -134,6 +139,16 @@ pub fn schema_ddl(embedding_dim: usize) -> String {
     ddl
 }
 
+/// The same schema as [`schema_ddl`], but every statement is `IF NOT EXISTS`:
+/// on a store that already holds the schema it does no work, and on a fresh
+/// one it creates everything. This is what runs on connect.
+///
+/// A schema change shipped in a later version is NOT applied to an existing
+/// store by this; call `build_indices_and_constraints` to redefine it.
+pub fn schema_ddl_if_missing(embedding_dim: usize) -> String {
+    schema_ddl(embedding_dim).replace(" OVERWRITE ", " IF NOT EXISTS ")
+}
+
 /// `REMOVE` statements for every index/analyzer/table defined above, used by
 /// `build_indices_and_constraints(delete_existing = true)`. Each carries
 /// `IF EXISTS` so a fresh database (nothing to drop) is a clean no-op.
@@ -201,6 +216,25 @@ mod tests {
         }
         assert!(ddl.contains("HNSW DIMENSION 1024 TYPE F32 DIST COSINE"));
         assert!(ddl.contains("FULLTEXT ANALYZER chronicle_ascii BM25"));
+    }
+
+    #[test]
+    fn connect_ddl_never_rebuilds_an_index() {
+        let ddl = schema_ddl_if_missing(1536);
+        assert!(!ddl.contains("OVERWRITE"), "connect DDL must not OVERWRITE");
+        // Same statements as the rebuild flavour, only the clause differs.
+        assert_eq!(
+            ddl.matches("DEFINE ").count(),
+            schema_ddl(1536).matches("DEFINE ").count()
+        );
+        for define in ddl.lines().filter(|l| l.starts_with("DEFINE ")) {
+            assert!(define.contains(" IF NOT EXISTS "), "{define}");
+        }
+    }
+
+    #[test]
+    fn rebuild_ddl_still_overwrites() {
+        assert!(schema_ddl(1536).contains("DEFINE INDEX OVERWRITE entity_name_emb_hnsw"));
     }
 
     #[test]

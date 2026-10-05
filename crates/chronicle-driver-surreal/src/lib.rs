@@ -31,7 +31,7 @@ mod document_chunks;
 mod filters;
 mod schema;
 
-pub use schema::{ANALYZER, DATABASE, NAMESPACE, schema_ddl};
+pub use schema::{ANALYZER, DATABASE, NAMESPACE, schema_ddl, schema_ddl_if_missing};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -120,8 +120,10 @@ impl SurrealDriver {
             .await
             .map_err(|e| DriverError::Connection(format!("use_ns/use_db: {e}")))?;
         let driver = Self { db, embedding_dim };
+        // IF NOT EXISTS, not OVERWRITE: OVERWRITE rebuilds every index over the
+        // stored data, which made opening a populated store take minutes.
         driver
-            .run_ddl(&schema_ddl(embedding_dim), "schema_ddl")
+            .run_ddl(&schema_ddl_if_missing(embedding_dim), "schema_ddl")
             .await?;
         Ok(driver)
     }
@@ -1906,6 +1908,40 @@ mod tests {
         n.attributes
             .insert("role".into(), serde_json::Value::String("admin".into()));
         n
+    }
+
+    #[tokio::test]
+    async fn reopening_a_populated_store_keeps_data_and_does_not_redefine_schema() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().to_str().expect("utf-8 path");
+        let n = entity("Persisted", "g1");
+        {
+            let d = SurrealDriver::connect_embedded(path, 8)
+                .await
+                .expect("first open");
+            d.save_entity_nodes(std::slice::from_ref(&n)).await.unwrap();
+        }
+        // Second open runs the connect DDL again over a store that already
+        // holds the schema and a row. It must succeed and leave both intact.
+        // Dropping a driver releases the RocksDB LOCK asynchronously, so a
+        // reopen straight after can see "lock hold by current process".
+        let mut attempts = 0;
+        let d = loop {
+            match SurrealDriver::connect_embedded(path, 8).await {
+                Ok(d) => break d,
+                Err(e) if attempts < 50 => {
+                    attempts += 1;
+                    let _ = e;
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                Err(e) => panic!("second open: {e}"),
+            }
+        };
+        let got = d.get_entity_node(&n.uuid).await.unwrap().unwrap();
+        assert_eq!(got.name, "Persisted");
+        // An explicit rebuild is still available and still works.
+        d.build_indices_and_constraints(false).await.unwrap();
+        assert!(d.get_entity_node(&n.uuid).await.unwrap().is_some());
     }
 
     #[tokio::test]

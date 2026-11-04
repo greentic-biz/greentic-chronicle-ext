@@ -110,3 +110,20 @@ directory; there is no live-backup path.
 - `GET /v1/indexes/{index_id}/stats` reads the meta records (document and
   chunk-index counts kept beside each document), not a scan of the graph
   store.
+
+## Citation metadata
+
+A document may carry optional `title` and `source_url`, and each chunk an
+optional `section`. They are stored with the chunk and echoed on every
+`POST /v1/indexes/{id}/search` hit (omitted, never `null`, when unknown).
+`title`/`section` are kept when non-blank, at most 300 characters and free of
+control characters; `source_url` only when an absolute `https` URL with a host,
+no userinfo, at most 2048 bytes. A value that fails is dropped and the batch
+still lands.
+
+An upsert whose `content_hash` matches the stored one is skipped as
+`unchanged` unless it carries citation metadata that differs from what is
+stored, in which case the document is rewritten. An upsert with no citation
+field at all (an older client) is judged by the hash alone and leaves stored
+metadata untouched; a content change replaces the metadata with the new
+upsert's.

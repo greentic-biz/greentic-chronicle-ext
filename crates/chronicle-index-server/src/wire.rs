@@ -38,6 +38,11 @@ pub struct UpsertRequest {
 pub struct DocumentUpsert {
     pub document_id: String,
     pub content_hash: String,
+    /// Optional citation metadata; absent from an older client.
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub source_url: Option<String>,
     pub chunks: Vec<ChunkUpsert>,
 }
 
@@ -46,6 +51,8 @@ pub struct ChunkUpsert {
     pub chunk_index: i64,
     pub text: String,
     pub vector_b64: String,
+    #[serde(default)]
+    pub section: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -82,6 +89,13 @@ pub struct SearchHit {
     pub score: f64,
     pub document_id: String,
     pub chunk_index: i64,
+    /// Citation metadata, omitted from the JSON when unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub section: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

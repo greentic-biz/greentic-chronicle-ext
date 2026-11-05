@@ -228,6 +228,7 @@ async fn an_interrupted_write_leaves_no_permanently_orphaned_chunks() {
             document_id: "d1".to_string(),
             content_hash: "h1".to_string(),
             chunk_indexes: vec![0, 1, 2],
+            meta_fingerprint: None,
         })
         .await
         .expect("put intent record");

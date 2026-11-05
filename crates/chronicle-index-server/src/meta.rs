@@ -49,6 +49,9 @@ pub struct DocRecord {
     pub document_id: String,
     pub content_hash: String,
     pub chunk_indexes: Vec<i64>,
+    /// Digest of the citation metadata last stored, `None` for a record
+    /// written before citations existed or for a document that carries none.
+    pub meta_fingerprint: Option<String>,
 }
 
 const DDL: &str = "
@@ -279,6 +282,7 @@ mod tests {
             document_id: id.into(),
             content_hash: hash.into(),
             chunk_indexes: indexes.to_vec(),
+            meta_fingerprint: None,
         }
     }
 
@@ -341,6 +345,25 @@ mod tests {
         let removed = meta.delete_doc("g1", "d1").await.expect("delete");
         assert_eq!(removed.map(|d| d.chunk_indexes), Some(vec![0, 3]));
         assert!(meta.delete_doc("g1", "d1").await.expect("delete").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_record_written_before_citations_existed_still_reads() {
+        let meta = MetaStore::memory().await.expect("meta");
+        // Exactly the fields the previous build wrote: no meta_fingerprint.
+        meta.db
+            .query(
+                "CREATE $id CONTENT { group_id: 'g1', document_id: 'old', \
+                 content_hash: 'h', chunk_indexes: [0, 1] }",
+            )
+            .bind(("id", doc_rid("g1", "old")))
+            .await
+            .expect("create")
+            .check()
+            .expect("check");
+        let got = meta.get_doc("g1", "old").await.expect("get").expect("some");
+        assert_eq!(got.meta_fingerprint, None);
+        assert_eq!(got.chunk_indexes, vec![0, 1]);
     }
 
     #[test]

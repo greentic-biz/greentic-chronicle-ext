@@ -8,6 +8,7 @@ use chronicle_core::driver::EntityNodeOps as _;
 use chronicle_core::ingest_chunks_with_vectors;
 
 use crate::auth::Scope;
+use crate::citation::{self, DocumentCitation};
 use crate::error::{ApiError, ApiJson};
 use crate::meta::{DocRecord, now_ms};
 use crate::routes::indexes::{chunk_uuids, dims_of};
@@ -27,6 +28,22 @@ struct PreparedDocument {
     content_hash: String,
     chunk_indexes: Vec<i64>,
     chunks: Vec<DocumentChunk>,
+    citation: DocumentCitation,
+}
+
+/// True when the document must be (re)written: its content moved, or it
+/// carries citation metadata that differs from what is stored. A document
+/// with no citation metadata at all (an older client's) is judged by its
+/// content hash alone, so it never wipes metadata a newer client stored.
+fn needs_write(previous: Option<&DocRecord>, doc: &PreparedDocument) -> bool {
+    let Some(previous) = previous else {
+        return true;
+    };
+    if previous.content_hash != doc.content_hash {
+        return true;
+    }
+    !doc.citation.is_empty()
+        && previous.meta_fingerprint.as_deref() != Some(doc.citation.fingerprint().as_str())
 }
 
 /// Validates one document's chunks — indexes, every vector — so the handler
@@ -37,6 +54,12 @@ fn prepare(doc: DocumentUpsert, dims: usize) -> Result<PreparedDocument, ApiErro
     let mut seen = HashSet::new();
     let mut chunk_indexes = Vec::with_capacity(doc.chunks.len());
     let mut chunks = Vec::with_capacity(doc.chunks.len());
+    let mut sections = Vec::new();
+    let mut citation = DocumentCitation {
+        title: citation::checked_text(doc.title.as_deref()),
+        source_url: citation::checked_url(doc.source_url.as_deref()),
+        sections: Vec::new(),
+    };
     for chunk in doc.chunks {
         let index = usize::try_from(chunk.chunk_index)
             .map_err(|_| ApiError::bad_request("chunk_index must be non-negative"))?;
@@ -50,6 +73,9 @@ fn prepare(doc: DocumentUpsert, dims: usize) -> Result<PreparedDocument, ApiErro
             return Err(ApiError::dim_mismatch(StatusCode::UNPROCESSABLE_ENTITY));
         }
         chunk_indexes.push(chunk.chunk_index);
+        if let Some(section) = citation::checked_text(chunk.section.as_deref()) {
+            sections.push((chunk.chunk_index, section));
+        }
         chunks.push(DocumentChunk {
             doc_id: doc.document_id.clone(),
             chunk_index: index,
@@ -58,7 +84,14 @@ fn prepare(doc: DocumentUpsert, dims: usize) -> Result<PreparedDocument, ApiErro
             embedding: Some(vector),
         });
     }
+    citation.sections = sections;
+    for chunk in &mut chunks {
+        if let Ok(index) = i64::try_from(chunk.chunk_index) {
+            chunk.metadata = citation.chunk_attributes(index);
+        }
+    }
     Ok(PreparedDocument {
+        citation,
         document_id: doc.document_id,
         content_hash: doc.content_hash,
         chunk_indexes,
@@ -104,10 +137,7 @@ pub async fn upsert(
     let (mut upserted, mut unchanged) = (0, 0);
     for doc in prepared {
         let previous = state.meta.get_doc(&group_id, &doc.document_id).await?;
-        if previous
-            .as_ref()
-            .is_some_and(|p| p.content_hash == doc.content_hash)
-        {
+        if !needs_write(previous.as_ref(), &doc) {
             unchanged += 1;
             continue;
         }
@@ -152,6 +182,10 @@ pub async fn upsert(
                 document_id: doc.document_id.clone(),
                 content_hash: previous_hash,
                 chunk_indexes: union.clone(),
+                // The intent record keeps the OLD fingerprint, so a crash
+                // before the final write leaves a record that still
+                // disagrees with the incoming metadata and is redone.
+                meta_fingerprint: previous.as_ref().and_then(|p| p.meta_fingerprint.clone()),
             })
             .await?;
 
@@ -176,6 +210,7 @@ pub async fn upsert(
                 document_id: doc.document_id,
                 content_hash: doc.content_hash,
                 chunk_indexes: doc.chunk_indexes,
+                meta_fingerprint: (!doc.citation.is_empty()).then(|| doc.citation.fingerprint()),
             })
             .await?;
         upserted += 1;

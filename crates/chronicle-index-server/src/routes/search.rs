@@ -8,6 +8,7 @@ use chronicle_core::search::{NodeSearchConfig, SearchFilters, rrf};
 use chronicle_core::types::EntityNode;
 
 use crate::auth::Scope;
+use crate::citation;
 use crate::error::{ApiError, ApiJson};
 use crate::routes::indexes::dims_of;
 use crate::state::AppState;
@@ -50,7 +51,15 @@ fn fuse(
                 return None;
             }
             let hit = node_to_chunk_hit(node, score);
+            let attrs = &hit.metadata;
             Some(SearchHit {
+                title: citation::attribute(attrs, citation::KEY_TITLE, citation::checked_text),
+                source_url: citation::attribute(
+                    attrs,
+                    citation::KEY_SOURCE_URL,
+                    citation::checked_url,
+                ),
+                section: citation::attribute(attrs, citation::KEY_SECTION, citation::checked_text),
                 document_id: hit.doc_id?,
                 chunk_index: i64::try_from(hit.chunk_index?).ok()?,
                 text: hit.text,

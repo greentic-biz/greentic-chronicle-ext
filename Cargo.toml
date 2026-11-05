@@ -31,6 +31,7 @@ chronicle-index-server = { path = "crates/chronicle-index-server" }
 axum = "0.8"
 sha2 = "0.10"
 base64 = "0.22"
+url = "2"
 subtle = "2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tower = { version = "0.5", features = ["util"] }

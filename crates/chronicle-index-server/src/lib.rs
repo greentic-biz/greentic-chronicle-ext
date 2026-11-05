@@ -5,6 +5,7 @@
 //! every query arrives with its vector.
 
 pub mod auth;
+pub mod citation;
 pub mod config;
 pub mod error;
 pub mod meta;
